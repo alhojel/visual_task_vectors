@@ -113,11 +113,11 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16', device='cpu'):
 @torch.no_grad()
 def generate_image(orig_image, model, ids_shuffle, len_keep: int, device: str = 'cpu'):
     """ids_shuffle is [bs, 196]"""
-    mask, orig_image, x = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image)
+    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image)
     num_patches = 14
     y = x.argmax(dim=-1)
     im_paste, mask, orig_image = decode_raw_predicion(mask, model, num_patches, orig_image, y)
-    return orig_image, im_paste[0], mask
+    return orig_image, im_paste[0], mask, latents
 
 
 def decode_raw_predicion(mask, model, num_patches, orig_image, y):
@@ -141,6 +141,7 @@ def decode_raw_predicion(mask, model, num_patches, orig_image, y):
 
 @torch.no_grad()
 def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image):
+    latents_holder = []
     ids_shuffle = ids_shuffle.to(device)
     # make it a batch-like
     orig_image = convert_to_tensor(orig_image).to(device)
@@ -170,6 +171,7 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image):
     # apply Transformer blocks
     for blk in model.blocks:
         latent = blk(latent)
+        latents_holder.append(latent.detach().cpu().numpy())
     latent = model.norm(latent)
     x = model.decoder_embed(latent)
     # append mask tokens to sequence
@@ -203,12 +205,13 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image):
         x = x + blk.drop_path(x_temp)
 
         x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
+        latents_holder.append(x.detach().cpu().numpy())
     x = model.decoder_norm(x)
     # predictor projection
     x = model.decoder_pred(x)
     # remove cls token
     x = x[:, 1:, :]
-    return mask, orig_image, x
+    return mask, orig_image, x, latents_holder
 
 
 @torch.no_grad()

@@ -69,7 +69,6 @@ class DatasetPASCAL(Dataset):
         grid.append(self.colorization_grid(query_img, support_img))
         grid.append(self.neutral_copy_grid(query_img, support_img))
         grid.append(self.bw_grid(query_img, support_img))
-        grid.append(self.inpaint_black_grid(query_img, support_img))
         grid.append(self.lowlight_grid(query_img, support_img))
         grid.append(self.inpaint_black_grid(query_img, support_img, r=1))
         grid.append(self.inpaint_black_grid(query_img, support_img, r=2))

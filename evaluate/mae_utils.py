@@ -111,9 +111,9 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16', device='cpu'):
 
 
 @torch.no_grad()
-def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu'):
+def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, only_cls = True, device: str = 'cpu'):
     """ids_shuffle is [bs, 196]"""
-    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec)
+    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, only_cls)
     num_patches = 14
     y = x.argmax(dim=-1)
     im_paste, mask, orig_image = decode_raw_predicion(mask, model, num_patches, orig_image, y)
@@ -140,7 +140,7 @@ def decode_raw_predicion(mask, model, num_patches, orig_image, y):
 
 
 @torch.no_grad()
-def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec):
+def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, only_cls):
     latents_holder = []
     ids_shuffle = ids_shuffle.to(device)
     # make it a batch-like
@@ -172,7 +172,14 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     for block_num, blk in enumerate(model.blocks):
         latent = blk(latent)
         if e_vec is not None:
-            latent[0][0] = latent[0][0] + e_vec[block_num]
+            assert e_vec.shape[1] == 148
+            if only_cls:
+                assert latent[0][0].shape == e_vec[block_num][0].shape
+                latent[0][0] = latent[0][0] + e_vec[block_num][0]
+            else:
+                assert latent[0].shape == e_vec[block_num].shape
+                latent[0] = latent[0] + e_vec[block_num]
+
         latents_holder.append(latent.detach().cpu().numpy())
         
     latent = model.norm(latent)
@@ -209,7 +216,14 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
 
         x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
         if d_vec is not None:
-            x = x + d_vec[block_num]
+            assert d_vec.shape[1] == 197
+            if only_cls:
+                assert x[0].shape == d_vec[block_num][0].shape
+                x[0] = x[0] + d_vec[block_num][0]
+            else:
+                assert x.shape == d_vec[block_num].unsqueeze(0).shape
+                x = x + d_vec[block_num].unsqueeze(0)
+            
         latents_holder.append(x.detach().cpu().numpy())
 
     x = model.decoder_norm(x)

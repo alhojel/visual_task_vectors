@@ -25,15 +25,13 @@ def get_args():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--t', default=[0, 0, 0], type=float, nargs='+')
     parser.add_argument('--ckpt', help='model checkpoint')
-    parser.add_argument('--split', default=0, type=int)
+    parser.add_argument('--split', default=1, type=int)
     parser.add_argument('--purple', default=0, type=int)
     parser.add_argument('--flip', default=0, type=int)
     parser.add_argument('--save_images', default=None, type=int, help='Save images')
     parser.add_argument('--query_support_list_file', default=None, type=str, help='Directory of query support list file')
     parser.add_argument('--iters', default=1000, type=int)
     parser.add_argument('--store_latents', default=None, type=str, help='Where to store latents')
-    parser.add_argument('--task_vector', default=None, type=str, help='What task vector to use')
-    parser.add_argument('--task', default=0, type=float, help='Which task to do')
 
 
     return parser
@@ -71,15 +69,10 @@ def write_latent(file_path, pass_id, latent, label, metric):
         label_group.create_dataset('metric', data=metric)
 
 
-def _generate_result_for_canvas(args, model, canvas, encoder_task_vector=None, decoder_task_vector=None):
+def _generate_result_for_canvas(args, model, canvas):
     """canvas is already in the right range."""
     ids_shuffle, len_keep = generate_mask_for_evaluation()
-    if encoder_task_vector is not None and decoder_task_vector is not None:
-
-        _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
-                                    len_keep = len_keep, e_vec = encoder_task_vector.to(args.device), d_vec = decoder_task_vector.to(args.device), device=args.device)
-    else:
-        _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
+    _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
                                     len_keep, device=args.device)
     canvas = torch.einsum('chw->hwc', canvas)
     canvas = torch.clip((canvas.cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int().numpy()
@@ -106,7 +99,7 @@ def evaluate(args):
     model = prepare_model(args.ckpt, arch=args.model)
     _ = model.to(args.device)
 
-    captions = ["segmentation", "colorization", "neutral copy", "uncolor", "lowlight enhance", "inpaint single random", "inpaint double random"]
+    captions = ["segmentation", "colorization", "uncolor", "lowlight enhance", "inpaint single random", "inpaint double random"]
     
     for idx in trange(len(ds)):
         canvas = ds[idx]['grid']
@@ -114,31 +107,39 @@ def evaluate(args):
         query_name = ds[idx]['query_name']
         support_name = ds[idx]['support_name']
 
-        og_holder = []
-        gen_holder = []
+        
         
         for i in range(len(canvas)):
-            if i != args.task:
-                continue
+
+            og_holder = []
+            gen_holder = []
+
+            curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas)
 
 
-            if args.task_vector is not None:
-                with open(args.task_vector, "rb") as file:
-                    data = pickle.load(file)
-                    decoder_task_vector = data["seg_decoder_data_list"]
-                    encoder_task_vector = data["seg_encoder_data_list"]
-            
-                curr_canvas = (canvas[2] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-                original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, encoder_task_vector, decoder_task_vector)
-            else:
-                curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-                original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas)
+            curr_canvas = canvas[i].clone().detach()
+            midpoint = curr_canvas.shape[2] // 2
+            left_half = curr_canvas[:, :, :midpoint]
+            curr_canvas[:, :, midpoint:] = left_half
 
+            curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            og2, gen2, latents_neutral = _generate_result_for_canvas(args, model, curr_canvas)
+
+            #import pdb; breakpoint()
+
+            for index in range(len(latents)):
+                latents[index] = latents[index] - latents_neutral[index]
+                
             og_holder.append(original_image)
             gen_holder.append(generated_result)
+
+            og_holder.append(og2)
+            gen_holder.append(gen2)
+
                 
             if i == 0:
-                metric = segmentation_iou = evaluate_segmentation(original_image, generated_result, args)["iou"]
+                metric = segmentation_iou = evaluate_mse(original_image, generated_result, args)["mse"]
             if i == 1:
                 metric = colorization_mse = evaluate_mse(original_image, generated_result, args)["mse"]
             if i == 2:
@@ -155,58 +156,28 @@ def evaluate(args):
             if args.store_latents:
                 try:
                     write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i], metric)
-                except:
-                    print(f"Failed to write latent for {query_name}___{support_name}")
+                except Exception as e:
+                    print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
             
-        if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
-        
-            og_holder = [np.array(img) for img in og_holder]
-            gen_holder = [np.array(img) for img in gen_holder]
+            if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
+            
+                og_holder = [np.array(img) for img in og_holder]
+                gen_holder = [np.array(img) for img in gen_holder]
 
-            # Determine the number of images
-            num_images = len(og_holder)
+                fig, axs = plt.subplots(2, 2, figsize=(8, 8))
 
-            # Handling the case where there is only one image
-            if num_images == 1:
-                fig, axs = plt.subplots(2, 1, figsize=(3.5, 8))
-                axs = axs.reshape(2, -1)  # Reshape axs to 2D array for consistency
-            else:
-                fig, axs = plt.subplots(2, num_images, figsize=(3.5*num_images, 8))
+                for index in range(2):
+                    axs[0, index].imshow(og_holder[index])
+                    axs[0, index].axis('off')  # Turn off axis
 
-            for i in range(num_images):
-                axs[0, i].imshow(og_holder[i])
-                axs[0, i].axis('off')  # Turn off axis
+                    axs[1, index].imshow(gen_holder[index])
+                    axs[1, index].axis('off')  # Turn off axis
 
-                axs[1, i].imshow(gen_holder[i])
-                axs[1, i].axis('off')  # Turn off axis
+                plt.tight_layout()
+                plt.subplots_adjust(bottom=0.1)  # Adjust as needed
+                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}_{captions[i]}.png'))
+                plt.show()
 
-            plt.tight_layout()
-            plt.subplots_adjust(bottom=0.1)  # Adjust as needed
-            plt.savefig(os.path.join(args.output_dir, f'combined_{idx}.png'))
-            plt.show()
-
-        
-        with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
-            current_metric = {}
-            current_metric["query_name"] = query_name
-            current_metric["support_name"] = support_name
-
-            if 0 == args.task:
-                current_metric["segmentation_iou"] = segmentation_iou
-            if 1 == args.task:
-                current_metric["colorization_mse"] = colorization_mse
-            if 2 == args.task:
-                current_metric["bw_mse"] = bw_mse
-            if 3 == args.task:
-                current_metric["neutral_copy_mse"] = neutral_copy_mse
-            if 4 == args.task:
-                current_metric["lowlight_mse"] = lowlight_mse
-            if 5 == args.task:
-                current_metric["inpaint_r1"] = inpaint1_mse
-            if 6 == args.task:
-                current_metric["inpaint_r2"] = inpaint2_mse
-
-            log.write(str(current_metric) + '\n')
  
 def evaluate_segmentation(original_image, generated_result, args):
     if args.purple:

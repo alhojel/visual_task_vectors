@@ -25,7 +25,7 @@ def get_args():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--t', default=[0, 0, 0], type=float, nargs='+')
     parser.add_argument('--ckpt', help='model checkpoint')
-    parser.add_argument('--split', default=0, type=int)
+    parser.add_argument('--split', default=1, type=int)
     parser.add_argument('--purple', default=0, type=int)
     parser.add_argument('--flip', default=0, type=int)
     parser.add_argument('--save_images', default=None, type=int, help='Save images')
@@ -37,13 +37,13 @@ def get_args():
     return parser
 
 
-def _generate_result_for_canvas(args, model, canvas, encoder_task_vector=None, decoder_task_vector=None):
+def _generate_result_for_canvas(args, model, canvas, encoder_task_vector=None, decoder_task_vector=None, only_cls=True):
     """canvas is already in the right range."""
     ids_shuffle, len_keep = generate_mask_for_evaluation()
     if encoder_task_vector is not None and decoder_task_vector is not None:
 
         _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
-                                    len_keep = len_keep, e_vec = encoder_task_vector.to(args.device), d_vec = decoder_task_vector.to(args.device), device=args.device)
+                                    len_keep = len_keep, e_vec = encoder_task_vector.to(args.device), d_vec = decoder_task_vector.to(args.device), device=args.device, only_cls=only_cls)
     else:
         _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
                                     len_keep, device=args.device)
@@ -70,13 +70,13 @@ def evaluate(args):
     model = prepare_model(args.ckpt, arch=args.model)
     _ = model.to(args.device)
 
-    captions = ['label_segmentation', 'label_colorization', "neutral copy", "label_uncolor", "label_lowlight enhance", 'label_inpaint single random', 'label_inpaint double random']
+    captions = ['label_segmentation', 'label_colorization', "label_uncolor", "label_lowlight enhance", 'label_inpaint single random', 'label_inpaint double random']
 
 
     with open(args.task_vector, "rb") as file:
         data = pickle.load(file)
         
-    vector_task_labels = data.keys()
+    vector_task_labels = list(data.keys())
     vector_type_labels = data[vector_task_labels[0]].keys()
 
     for idx in trange(len(ds)):
@@ -84,69 +84,104 @@ def evaluate(args):
 
         query_name = ds[idx]['query_name']
         support_name = ds[idx]['support_name']
-
-        gen_holder = []
-        og_holder = []
         
         for i in range(len(canvas)):
-            if i == 2:
-                continue
+
+            gen_holder = []
+            og_holder = []
+            label_holder = []
 
             original_image = np.uint8(torch.clip(torch.einsum('chw->hwc', canvas[i]) * 255, 0, 255).int().numpy())
 
             og_holder.append(original_image)
+            label_holder.append("Ground Truth")
+            label_holder.append("Actual Prompt")
+
+            #Original prompt
+            curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas)
+
+            og_holder.append(generated_result)
+                    
+            
+            with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
+                current_metric = {}
+                current_metric["query_name"] = query_name
+                current_metric["support_name"] = support_name
+                current_metric["task"] = captions[i]
+                current_metric["metric"] = evaluate_mse(original_image, generated_result, args)["mse"]
+                if i == 0:
+                    h = evaluate_segmentation(original_image, generated_result, args)
+                    current_metric["iou"] = h["iou"]
+                    current_metric["accuracy"] = h["accuracy"]
+            
+                log.write(str(current_metric) + '\n')
+                
 
             assert captions[i] in vector_task_labels
+            assert len(captions) == len(vector_task_labels)
+
+            vector_type_labels = ["mean"]
+
+            coeff_array = np.arange(0, 1, 0.05)
 
             for vector_type in vector_type_labels:
 
-                encoder_task_vector = data[captions[i]][vector_type]["encoder"]
-                decoder_task_vector = data[captions[i]][vector_type]["decoder"]
+                encoder_task_vector = data[captions[i]][vector_type][0]["encoder"]
+                decoder_task_vector = data[captions[i]][vector_type][0]["decoder"]
+
+
+                for only_cls in [False]:
+                    for only_decoder in [True]:
+                        for coeff in coeff_array:
+                            
+                            curr_canvas = canvas[i].clone().detach()
+                            midpoint = curr_canvas.shape[2] // 2
+                            left_half = curr_canvas[:, :, :midpoint]
+                            curr_canvas[:, :, midpoint:] = left_half
+
+                            curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+
+                            if only_decoder:
+                                encoder_task_vector_multiplier = 0
+                            else:
+                                encoder_task_vector_multiplier = coeff
+
+                            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, encoder_task_vector_multiplier*encoder_task_vector, coeff*decoder_task_vector, only_cls = only_cls)
+
+                            original_image = np.uint8(torch.clip(torch.einsum('chw->hwc', canvas[i]) * 255, 0, 255).int().numpy())
+
+                            gen_holder.append(generated_result)
+                            label_holder.append("Lambda: "+str(coeff)[:3])
+
         
-                coeff_array = np.arange(0, 2, 0.25)
-                coeff_array.append(None)
+                            with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
+                                current_metric = {}
+                                current_metric["query_name"] = query_name
+                                current_metric["support_name"] = support_name
+                                current_metric["task"] = captions[i]
+                                current_metric["lambda"] = coeff
+                                current_metric["metric"] = evaluate_mse(original_image, generated_result, args)["mse"]
+                                current_metric["vector"] = vector_type
+                                current_metric["encoder"] = not only_decoder
+                                current_metric["only_cls"] = only_cls
+                                if i == 0:
+                                    h = evaluate_segmentation(original_image, generated_result, args)
+                                    current_metric["iou"] = h["iou"]
+                                    current_metric["accuracy"] = h["accuracy"]
 
-                for coeff in coeff_array:
-                    if coeff is None:
-                        curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-                        original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas)
-                    else:
-                        curr_canvas = (canvas[2] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-                        original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, coeff*encoder_task_vector, coeff*decoder_task_vector)
-                    
+                                current_metric["r_metric"] = evaluate_mse(og_holder[1], generated_result, args)["mse"]
 
-                    original_image = np.uint8(torch.clip(torch.einsum('chw->hwc', canvas[i]) * 255, 0, 255).int().numpy())
-
-                    gen_holder.append(generated_result)
-
-                    if i == 0:
-                        metric = segmentation_iou = evaluate_segmentation(original_image, generated_result, args)["iou"]
-                    if i == 1:
-                        metric = colorization_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-                    if i == 2:
-                        metric = neutral_copy_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-                    if i == 3:
-                        metric = bw_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-                    if i == 4:
-                        metric = lowlight_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-                    if i == 5:
-                        metric = inpaint1_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-                    if i == 6:
-                        metric = inpaint2_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-
-                    
-                    with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
-                        current_metric = {}
-                        current_metric["query_name"] = query_name
-                        current_metric["support_name"] = support_name
-                        current_metric["task"] = captions[i]
-                        current_metric["lambda"] = coeff
-                        current_metric["metric"] = metric
-                        current_metric["vector"] = vector_type
-                    
-                        log.write(str(current_metric) + '\n')
+                                if i == 0:
+                                    h = evaluate_segmentation(og_holder[1], generated_result, args)
+                                    current_metric["r_iou"] = h["iou"]
+                                    current_metric["r_accuracy"] = h["accuracy"]
+                            
+                            
+                                log.write(str(current_metric) + '\n')
+                              
             
-            """ if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
+            if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
                 
                 og_holder = [np.array(img) for img in og_holder]
                 gen_holder = [np.array(img) for img in gen_holder]
@@ -155,24 +190,25 @@ def evaluate(args):
                 num_images = len(og_holder)+len(gen_holder)
 
                 # Handling the case where there is only one image
-                if num_images == 1:
-                    fig, axs = plt.subplots(2, 1, figsize=(3.5, 8))
-                    axs = axs.reshape(2, -1)  # Reshape axs to 2D array for consistency
-                else:
-                    fig, axs = plt.subplots(1, num_images, figsize=(3.5*num_images, 8))
+                fig, axs = plt.subplots(2, 11, figsize=(24, 8))
+                
+                axs[0,0].imshow(og_holder[0])
+                axs[0,0].axis('off') 
+                axs[0,0].set_title(label_holder[0])
 
-                for i in range(num_images):
-                    if i == 0:
-                        axs[i].imshow(og_holder[0])
-                        axs[i].axis('off') 
-                    else:
-                        axs[i].imshow(gen_holder[i-1])
-                        axs[i].axis('off') 
+                axs[1,0].imshow(og_holder[1])
+                axs[1,0].axis('off') 
+                axs[1,0].set_title(label_holder[1])
+
+                for z in range(len(gen_holder)):
+                    axs[z//10, 1+ (z%10)].imshow(gen_holder[z])
+                    axs[z//10, 1+ (z%10)].axis('off') 
+                    axs[z//10, 1+ (z%10)].set_title(label_holder[z+2])
 
                 plt.tight_layout()
                 plt.subplots_adjust(bottom=0.1)  # Adjust as needed
-                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}.png'))
-                plt.show() """
+                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}_{captions[i]}.png'))
+                plt.show() 
  
 def evaluate_segmentation(original_image, generated_result, args):
     if args.purple:

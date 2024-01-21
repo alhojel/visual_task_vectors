@@ -14,6 +14,18 @@ import numpy as np
 import h5py
 import pickle
 
+
+import numpy as np
+import os
+from contextlib import ExitStack
+import torch
+import torchvision.transforms as T
+from PIL import Image
+
+from improv.pipelines.pipeline_improv import  IMProvPipeline
+
+
+
 def get_args():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
     parser.add_argument('--model', default='mae_vit_large_patch16', type=str, metavar='MODEL',
@@ -25,7 +37,7 @@ def get_args():
     parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--t', default=[0, 0, 0], type=float, nargs='+')
     parser.add_argument('--ckpt', help='model checkpoint')
-    parser.add_argument('--split', default=1, type=int)
+    parser.add_argument('--split', default=0, type=int)
     parser.add_argument('--purple', default=0, type=int)
     parser.add_argument('--flip', default=0, type=int)
     parser.add_argument('--save_images', default=None, type=int, help='Save images')
@@ -63,21 +75,57 @@ def write_latent(file_path, pass_id, latent, label, metric):
         label_group = pass_group.require_group(f'label_{label}')
 
         # Create datasets for latent and metric within the label group
-        label_group.create_dataset('encoder_latent', data=np.array(latent[:24]), compression="gzip", compression_opts=2)
-        label_group.create_dataset('decoder_latent', data=np.array(latent[24:]), compression="gzip", compression_opts=2)
+        label_group.create_dataset('decoder_latent', data=np.array(latent), compression="gzip", compression_opts=2)
 
         label_group.create_dataset('metric', data=metric)
 
 
-def _generate_result_for_canvas(args, model, canvas):
+def _generate_result_for_canvas(args, model, canvas, input_prompts=""):
     """canvas is already in the right range."""
-    ids_shuffle, len_keep = generate_mask_for_evaluation()
-    _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
-                                    len_keep, device=args.device)
-    canvas = torch.einsum('chw->hwc', canvas)
-    canvas = torch.clip((canvas.cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int().numpy()
-    assert canvas.shape == im_paste.shape, (canvas.shape, im_paste.shape)
-    return np.uint8(canvas), np.uint8(im_paste), latents
+    if args.model != "improv":
+        ids_shuffle, len_keep = generate_mask_for_evaluation()
+        _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
+                                        len_keep, device=args.device)
+        canvas = torch.einsum('chw->hwc', canvas)
+        canvas = torch.clip((canvas.cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int().numpy()
+        assert canvas.shape == im_paste.shape, (canvas.shape, im_paste.shape)
+        return np.uint8(canvas), np.uint8(im_paste), latents
+    else:
+        input_mask = torch.zeros(1, 224, 224).to(args.device)
+        input_mask[:, 113:224, 113:224] = 1
+
+        generator = torch.Generator(device=model.device).manual_seed(42)
+        init_image = canvas.unsqueeze(0).to(args.device)
+        with ExitStack() as stack:
+            stack.enter_context(torch.no_grad())
+
+            
+
+            raw_inpaint, latents = model(
+                input_prompts,
+                image=init_image,
+                mask_image=input_mask,
+                generator=generator,
+                height=init_image.shape[-2],
+                width=init_image.shape[-1],
+                guidance_scale=1.0,
+                num_inference_steps=1,
+                choice_temperature=0.0,
+                output_type="torch",
+            )
+            raw_inpaint = raw_inpaint.images
+
+        im_paste = raw_inpaint * input_mask.unsqueeze(1) + init_image * (
+            1 - input_mask.unsqueeze(1)
+        )[0]
+
+        canvas = torch.einsum('chw->hwc', canvas)
+        im_paste = torch.einsum('chw->hwc', im_paste[0])
+        im_paste = torch.clip((im_paste.cpu().detach()) * 255, 0, 255).int().numpy()
+        canvas = torch.clip((canvas.cpu().detach()) * 255, 0, 255).int().numpy()
+        assert canvas.shape == im_paste.shape, (canvas.shape, im_paste.shape)
+
+        return np.uint8(canvas), np.uint8(im_paste), latents
 
 def evaluate(args):
     with open(os.path.join(args.output_dir, 'log.txt'), 'w') as log:
@@ -96,8 +144,14 @@ def evaluate(args):
     ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
                          flipped_order=args.flip, purple=args.purple, query_support_list_file=args.query_support_list_file, iters=args.iters)
     
-    model = prepare_model(args.ckpt, arch=args.model)
+    if args.model == "improv":
+        model = IMProvPipeline.from_pretrained(pretrained_model_name_or_path="xvjiarui/IMProv-v1-0")
+        _ = model.to(args.device)
+    else:
+        model = prepare_model(args.ckpt, arch=args.model)
+        
     _ = model.to(args.device)
+
 
     captions = ["segmentation", "colorization", "uncolor", "lowlight enhance", "inpaint single random", "inpaint double random"]
     
@@ -114,7 +168,12 @@ def evaluate(args):
             og_holder = []
             gen_holder = []
 
+            
             curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+
+            if args.model == "improv":
+                curr_canvas = canvas[i]
+
             original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas)
 
 
@@ -123,7 +182,9 @@ def evaluate(args):
             left_half = curr_canvas[:, :, :midpoint]
             curr_canvas[:, :, midpoint:] = left_half
 
-            curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            if args.model != "improv":
+                curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+
             og2, gen2, latents_neutral = _generate_result_for_canvas(args, model, curr_canvas)
 
             #import pdb; breakpoint()
@@ -198,8 +259,12 @@ def evaluate_segmentation(original_image, generated_result, args):
     return current_metric
     
 def evaluate_mse(target, ours, args):
-    ours = (np.transpose(ours/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-    target = (np.transpose(target/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+    if args.model != "improv":
+        ours = (np.transpose(ours/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+        target = (np.transpose(target/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+    else:
+        ours = (np.transpose(ours/255., [2, 0, 1]))
+        target = (np.transpose(target/255., [2, 0, 1]))
 
     target = target[:, 113:, 113:]
     ours = ours[:, 113:, 113:]

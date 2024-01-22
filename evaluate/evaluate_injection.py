@@ -181,14 +181,14 @@ def evaluate(args):
 
             assert captions[i] in vector_task_labels
 
-            coeff_array = np.arange(0, 2, 0.2)
+            coeff_array = np.arange(0, 4, 0.2)
 
             #decoder_task_vector = torch.tensor(data[captions[i]]["mean"][0]["decoder"])
             decoder_task_vector = torch.tensor(data[captions[i]]["decoder"])
             text_task_vector = torch.tensor(data[captions[i]]["text"])
 
-            for coeff in coeff_array:
-                for isolated_layer in np.arange(0,8,1):
+            for isolated_layer in np.arange(0,8,1):
+                for coeff in coeff_array:
                 
                     curr_canvas = canvas[i].clone().detach()
                     midpoint = curr_canvas.shape[2] // 2
@@ -277,7 +277,7 @@ def evaluate(args):
 
             assert captions[i] in vector_task_labels
 
-            coeff_array = np.arange(0, 1, 0.1)
+            coeff_array = np.arange(0, 1, 0.05)
             for coeff in coeff_array:
             
                 curr_canvas = canvas[i].clone().detach()
@@ -328,7 +328,7 @@ def evaluate(args):
                 # Determine the number of images
                 num_images = len(og_holder)+len(gen_holder)
                 num_rows = len(coeff_array)
-                num_cols = 1 + len(gen_holder)/10
+                num_cols = 1 + len(gen_holder)//10
 
                 fig_size = (num_cols * 3, num_rows * 3)
                 fig, axs = plt.subplots(num_rows, num_cols, figsize=fig_size)
@@ -411,12 +411,9 @@ def evaluate_segmentation(original_image, generated_result, args):
     return current_metric
     
 def evaluate_mse(target, ours, args):
-    if args.model != "improv":
-        ours = (np.transpose(ours/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-        target = (np.transpose(target/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-    else:
-        ours = (np.transpose(ours/255., [2, 0, 1]))
-        target = (np.transpose(target/255., [2, 0, 1]))
+    ours = (np.transpose(ours/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+    target = (np.transpose(target/255., [2, 0, 1]) - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+
     target = target[:, 113:, 113:]
     ours = ours[:, 113:, 113:]
     mse = np.mean((target - ours)**2)

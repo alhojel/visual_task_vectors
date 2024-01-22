@@ -24,9 +24,7 @@ from PIL import Image
 
 from improv.pipelines.pipeline_improv import  IMProvPipeline
 
-best_prompts = ["Left - input image, Right - Black and white foreground/background segmentation", "Left - input image, Right - Visually accurate colorization", None, "Left - input image, Right - Visually accurate light increase",  "Left - input image, Right - Inpainted image", None]
-nc_best_prompt = "Left - input image, Right - unchanged image"
-    
+
 
 def get_args():
     parser = argparse.ArgumentParser('MAE pre-training', add_help=False)
@@ -77,10 +75,7 @@ def write_latent(file_path, pass_id, latent, label, metric):
         label_group = pass_group.require_group(f'label_{label}')
 
         # Create datasets for latent and metric within the label group
-        
-        label_group.create_dataset('decoder_latent', data=np.array(latent[:-1]), compression="gzip", compression_opts=2)
-        label_group.create_dataset('text', data=np.array(latent[-1]), compression="gzip", compression_opts=2)
-
+        label_group.create_dataset('decoder_latent', data=np.array(latent), compression="gzip", compression_opts=2)
 
         label_group.create_dataset('metric', data=metric)
 
@@ -160,6 +155,17 @@ def evaluate(args):
 
     captions = ["segmentation", "colorization", "uncolor", "lowlight enhance", "inpaint single random", "inpaint double random"]
     
+    
+    best_prompts = ["Left - input image, Right - Black and white foreground/background segmentation", "Left - input image, Right - Visually accurate colorization", None, "Left - input image, Right - Visually accurate light increase",  "Left - input image, Right - Inpainted image", None]
+    nc_best_prompt = "Left - input image, Right - unchanged image"
+    
+    prompts = [["", "Left - input image, Right - Black and white foreground/background segmentation", "Left - input image, Right - Black and white foreground/background segmentation mask", "Left - input image, Right - Black and white subject segmentation"],
+                ["", "Left - input image, Right - Colorized image", "Left - input image, Right - Visually accurate colorized image", "Left - input image, Right - Visually accurate colorization"], "", 
+                ["", "Left - input image, Right - Lighting enhanced image", "Left - input image, Right - Visually accurate lighting enhanced image", "Left - input image, Right - Visually accurate light increase"], 
+                ["", "Left - input image, Right - inpainted black square", "Left - input image, Right - Inpainted image", "Left - input image, Right - Removed black square"], ""]
+
+    nc_prompts = ["", "Left - input image, Right - unchanged input image", "Left - input image, Right - unchanged image", "Left - input image, Right - copy"]
+
     for idx in trange(len(ds)):
         canvas = ds[idx]['grid']
 
@@ -173,90 +179,102 @@ def evaluate(args):
             if captions[i] == "uncolor" or captions[i] == 'inpaint double random':
                 continue
 
-            og_holder = []
-            gen_holder = []
+            gen_holder_nc = []
 
-            
-            curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            for text_prompt_index in range(len(nc_prompts)):
+                neutral_text_prompt = nc_prompts[text_prompt_index]
 
-            text_prompt = ""
+                curr_canvas = canvas[i].clone().detach()
+                midpoint = curr_canvas.shape[2] // 2
+                left_half = curr_canvas[:, :, :midpoint]
+                curr_canvas[:, :, midpoint:] = left_half
 
-            if args.model == "improv":
-                curr_canvas = canvas[i]
-                text_prompt = best_prompts[i]
+                if args.model != "improv":
+                    curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
 
-            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, input_prompts = text_prompt)
-            curr_canvas = canvas[i].clone().detach()
-            midpoint = curr_canvas.shape[2] // 2
-            left_half = curr_canvas[:, :, :midpoint]
-            curr_canvas[:, :, midpoint:] = left_half
+                og2, gen2, latents_neutral = _generate_result_for_canvas(args, model, curr_canvas, neutral_text_prompt)
 
-            if args.model != "improv":
-                curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+                #import pdb; breakpoint()
+                gen_holder_nc.append(gen2)
 
-            og2, gen2, latents_neutral = _generate_result_for_canvas(args, model, curr_canvas,  input_prompts = nc_best_prompt)
-
-            
-
-            for index in range(len(latents)):
-                latents[index] = latents[index] - latents_neutral[index]
+                metric = evaluate_mse(og2, gen2, args)["mse"]
                 
-            og_holder.append(original_image)
-            gen_holder.append(generated_result)
-
-            og_holder.append(og2)
-            gen_holder.append(gen2)
-
-                
-            if i == 0:
-                metric = segmentation_iou = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 1:
-                metric = colorization_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 2:
-                metric = neutral_copy_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 3:
-                metric = bw_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 4:
-                metric = lowlight_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 5:
-                metric = inpaint1_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 6:
-                metric = inpaint2_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-
-            with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
-                current_metric = {}
-                current_metric["query_name"] = query_name
-                current_metric["support_name"] = support_name
-                current_metric["task"] = captions[i]
-                current_metric["prompt"] = text_prompt
-                current_metric["metric"] = metric
-                current_metric["copymetric"] = evaluate_mse(og2, gen2, args)["mse"]
-                if i == 0:
-                    h = evaluate_segmentation(original_image, generated_result, args)
-                    current_metric["iou"] = h["iou"]
-                    current_metric["accuracy"] = h["accuracy"]
-
-                log.write(str(current_metric) + '\n')
-            
-            if args.store_latents:
-                try:
-                    write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i], metric)
-                except Exception as e:
-                    print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
+                with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
+                        current_metric = {}
+                        current_metric["query_name"] = query_name
+                        current_metric["support_name"] = support_name
+                        current_metric["task"] = "neutral_copy"
+                        current_metric["prompt"] = neutral_text_prompt
+                        current_metric["metric"] = metric
+                        
+                        log.write(str(current_metric) + '\n')
             
             if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
             
-                og_holder = [np.array(img) for img in og_holder]
+                gen_holder_nc = [np.array(img) for img in gen_holder_nc]
+
+                fig, axs = plt.subplots(5, 1, figsize=(5, 20))  # Changed to 5 rows, 1 column
+
+                # First one is just og2 image
+                axs[0].imshow(np.array(og2))
+                axs[0].axis('off')  # Turn off axis
+
+                # Then each one is gen_holder_nc
+                for index in range(1, 5):
+                    axs[index].imshow(gen_holder_nc[index-1])
+                    axs[index].axis('off')  # Turn off axis
+
+                plt.tight_layout()
+                plt.subplots_adjust(bottom=0.1)  # Adjust as needed
+                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}_neutral.png'))
+                plt.show()
+            
+            gen_holder = []
+
+            for text_prompt_index in range(len(prompts[i])):
+
+                text_prompt = prompts[i][text_prompt_index]
+
+                curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+                
+                if args.model == "improv":
+                    curr_canvas = canvas[i]
+
+                original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, text_prompt)
+
+                gen_holder.append(generated_result)
+
+                metric = evaluate_mse(original_image, generated_result, args)["mse"]
+                
+                with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
+                        current_metric = {}
+                        current_metric["query_name"] = query_name
+                        current_metric["support_name"] = support_name
+                        current_metric["task"] = captions[i]
+                        current_metric["prompt"] = text_prompt
+                        current_metric["metric"] = metric
+                        if i == 0:
+                            h = evaluate_segmentation(original_image, generated_result, args)
+                            current_metric["iou"] = h["iou"]
+                            current_metric["accuracy"] = h["accuracy"]
+
+                        log.write(str(current_metric) + '\n')
+            
+            if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
+            
                 gen_holder = [np.array(img) for img in gen_holder]
 
-                fig, axs = plt.subplots(2, 2, figsize=(8, 8))
+                num_images = len(gen_holder) + 1  # Count of original image and generated images
+                fig, axs = plt.subplots(num_images, 1, figsize=(5, 4*num_images))  # Adjusted to number of images
 
-                for index in range(2):
-                    axs[0, index].imshow(og_holder[index])
-                    axs[0, index].axis('off')  # Turn off axis
+                # First one is just the original image
+                axs[0].imshow(np.array(original_image))
+                axs[0].axis('off')  # Turn off axis
 
-                    axs[1, index].imshow(gen_holder[index])
-                    axs[1, index].axis('off')  # Turn off axis
+                # Then each one is from gen_holder
+                for index in range(1, num_images):
+                    axs[index].imshow(gen_holder[index-1])
+                    axs[index].axis('off')  # Turn off axis
 
                 plt.tight_layout()
                 plt.subplots_adjust(bottom=0.1)  # Adjust as needed
@@ -309,3 +327,4 @@ if __name__ == '__main__':
     if args.output_dir:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     evaluate(args)
+

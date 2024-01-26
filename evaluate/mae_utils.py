@@ -111,9 +111,9 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16', device='cpu'):
 
 
 @torch.no_grad()
-def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, only_cls = True, device: str = 'cpu'):
+def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu', convex = "False", drop_indices=None):
     """ids_shuffle is [bs, 196]"""
-    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, only_cls)
+    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices)
     num_patches = 14
     y = x.argmax(dim=-1)
     im_paste, mask, orig_image = decode_raw_predicion(mask, model, num_patches, orig_image, y)
@@ -135,12 +135,13 @@ def decode_raw_predicion(mask, model, num_patches, orig_image, y):
     orig_image = (
         torch.clip((orig_image[0].cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int()).unsqueeze(0)
     # MAE reconstruction pasted with visible patches
+    
     im_paste = orig_image * (1 - mask) + y * mask
-    return im_paste, mask, orig_image
+    return y, mask, orig_image
 
 
 @torch.no_grad()
-def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, only_cls):
+def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices):
     latents_holder = []
     ids_shuffle = ids_shuffle.to(device)
     # make it a batch-like
@@ -168,14 +169,15 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     cls_token = model.cls_token + model.pos_embed[:, :1, :]
     cls_tokens = cls_token.expand(latent.shape[0], -1, -1)
     latent = torch.cat((cls_tokens, latent), dim=1)
+
     # apply Transformer blocks
     for block_num, blk in enumerate(model.blocks):
         latent = blk(latent)
         if e_vec is not None:
             assert e_vec.shape[1] == 148
-            if only_cls:
-                assert latent[0][0].shape == e_vec[block_num][0].shape
-                latent[0][0] = latent[0][0] + e_vec[block_num][0]
+            if convex is not False or convex == 0:
+                assert latent[0].shape == e_vec[block_num].shape
+                latent[0] = (1-convex)*latent[0] + convex*e_vec[block_num]
             else:
                 assert latent[0].shape == e_vec[block_num].shape
                 latent[0] = latent[0] + e_vec[block_num]
@@ -187,6 +189,7 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     # append mask tokens to sequence
     mask_tokens = model.mask_token.repeat(
         x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
+    
     x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
     x_ = torch.gather(
         x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
@@ -194,6 +197,14 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     # add pos embed
     x = x + model.decoder_pos_embed
     # apply Transformer blocks
+
+    # Drop the indices in drop_indices across dim=1 and store them in a new tensor
+    if drop_indices is not None:
+        #  Temporary holder
+        #holder = torch.index_select(x, dim=1, index=torch.tensor(np.array(drop_indices)).to(x.device))
+        # Now also drop them from latent
+        x = torch.index_select(x, dim=1, index=torch.tensor([i for i in range(x.size(1)) if i not in drop_indices], device=latent.device))
+    
     for block_num, blk in enumerate(model.decoder_blocks):
         # Here is unrollment of the decoder blocks:
         x_temp = blk.norm1(x)
@@ -216,21 +227,41 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
 
         x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
         if d_vec is not None:
-            assert d_vec.shape[1] == 197
-            if only_cls:
-                assert x[0].shape == d_vec[block_num][0].shape
-                x[0] = x[0] + d_vec[block_num][0]
+            if convex != "False":
+                assert x.shape == d_vec[block_num].shape, (x.shape , d_vec[block_num].shape)
+                d_vec_norm = torch.norm(d_vec[block_num], dim=-1, keepdim=True)
+                convex_mask = d_vec_norm != 0
+                convex_mask = convex_mask.squeeze(0,-1)
+                assert d_vec[block_num][:,convex_mask].shape == x[:,convex_mask].shape, (d_vec[block_num][:,convex_mask].shape , x[:,convex_mask].shape,)
+                x[:,convex_mask] = (1-convex)*x[:,convex_mask] + convex*d_vec[block_num][:,convex_mask]
             else:
-                assert x.shape == d_vec[block_num].unsqueeze(0).shape
-                x = x + d_vec[block_num].unsqueeze(0)
+                assert x.shape == d_vec[block_num].shape, (x.shape , d_vec[block_num].shape)
+                x = x + d_vec[block_num]
             
         latents_holder.append(x.detach().cpu().numpy())
 
     x = model.decoder_norm(x)
     # predictor projection
     x = model.decoder_pred(x)
+
+    if drop_indices is not None:
+        # Re-insert zeros at the positions indicated by drop_indices
+        N, L, D = x.shape
+        # Create a tensor of zeros to insert
+        zeros_to_insert = torch.zeros(N, len(drop_indices), D, device=x.device)
+        # Calculate the indices for the non-dropped elements
+        non_dropped_indices = [i for i in range(L + len(drop_indices)) if i not in drop_indices]
+        # Create a new tensor that will hold the result with zeros inserted
+        x_reconstructed = torch.zeros(N, L + len(drop_indices), D, device=x.device)
+        # Insert the non-dropped elements into the reconstructed tensor
+        x_reconstructed[:, non_dropped_indices, :] = x
+        # Insert the zeros into the reconstructed tensor at the positions of drop_indices
+        x_reconstructed[:, drop_indices, :] = zeros_to_insert
+        x = x_reconstructed
+
     # remove cls token
     x = x[:, 1:, :]
+
     return mask, orig_image, x, latents_holder
 
 

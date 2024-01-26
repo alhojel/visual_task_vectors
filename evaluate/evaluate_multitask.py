@@ -36,7 +36,7 @@ def get_args():
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
     parser.add_argument('--base_dir', default='/shared/yossi_gandelsman/code/occlusionwalk/pascal', help='pascal base dir')
-    parser.add_argument('--seed', default=0, type=int)
+    parser.add_argument('--seed', default=15, type=int)
     parser.add_argument('--t', default=[0, 0, 0], type=float, nargs='+')
     parser.add_argument('--ckpt', help='model checkpoint')
     parser.add_argument('--split', default=0, type=int)
@@ -50,7 +50,7 @@ def get_args():
 
     return parser
 
-def write_latent(file_path, pass_id, latent, label, metric):
+def write_latent(file_path, pass_id, latent, label, metric, model_type="improv"):
     """
     Writes latent data, a string label, and a metric to an HDF5 file for a specific pass.
     Creates the file and/or groups if they don't exist.
@@ -78,16 +78,21 @@ def write_latent(file_path, pass_id, latent, label, metric):
 
         # Create datasets for latent and metric within the label group
         
-        label_group.create_dataset('decoder_latent', data=np.array(latent[:-1]), compression="gzip", compression_opts=2)
-        label_group.create_dataset('text', data=np.array(latent[-1]), compression="gzip", compression_opts=2)
+        if model_type == "improv":
+            label_group.create_dataset('decoder_latent', data=np.array(latent[:-1]), compression="gzip", compression_opts=2)
+            label_group.create_dataset('text', data=np.array(latent[-1]), compression="gzip", compression_opts=2)
+        else:
+            if len(latent) > 8:
+                latent = latent[-8:]
+            label_group.create_dataset('latent', data=np.array(latent), compression="gzip", compression_opts=2)
 
 
         label_group.create_dataset('metric', data=metric)
 
 
-def _generate_result_for_canvas(args, model, canvas, input_prompts=""):
+def _generate_result_for_canvas(args, model, canvas, input_prompts="", model_type="improv"):
     """canvas is already in the right range."""
-    if args.model != "improv":
+    if model_type != "improv":
         ids_shuffle, len_keep = generate_mask_for_evaluation()
         _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
                                         len_keep, device=args.device)
@@ -103,8 +108,6 @@ def _generate_result_for_canvas(args, model, canvas, input_prompts=""):
         init_image = canvas.unsqueeze(0).to(args.device)
         with ExitStack() as stack:
             stack.enter_context(torch.no_grad())
-
-            
 
             raw_inpaint, latents = model(
                 input_prompts,
@@ -133,12 +136,12 @@ def _generate_result_for_canvas(args, model, canvas, input_prompts=""):
         return np.uint8(canvas), np.uint8(im_paste), latents
 
 def evaluate(args):
-    with open(os.path.join(args.output_dir, 'log.txt'), 'w') as log:
+    with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
         log.write(str(args) + '\n')
     padding = 1
     image_transform = torchvision.transforms.Compose(
         [torchvision.transforms.Resize((224 // 2 - padding, 224 // 2 - padding), 3),
-         torchvision.transforms.ToTensor()])
+        torchvision.transforms.ToTensor()])
     mask_transform = [torchvision.transforms.Compose(
         [torchvision.transforms.Resize((224 // 2 - padding, 224 // 2 - padding), 3),
          torchvision.transforms.ToTensor()]), torchvision.transforms.Compose(
@@ -149,12 +152,16 @@ def evaluate(args):
     ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
                          flipped_order=args.flip, purple=args.purple, query_support_list_file=args.query_support_list_file, iters=args.iters)
     
-    if args.model == "improv":
-        model = IMProvPipeline.from_pretrained(pretrained_model_name_or_path="xvjiarui/IMProv-v1-0")
-        _ = model.to(args.device)
-    else:
-        model = prepare_model(args.ckpt, arch=args.model)
+    # """if args.model == "improv":
+    #     model = IMProvPipeline.from_pretrained(pretrained_model_name_or_path="xvjiarui/IMProv-v1-0")
+    #     _ = model.to(args.device)
+    # else:
+    #     model = prepare_model(args.ckpt, arch=args.model)"""
         
+    improv = IMProvPipeline.from_pretrained(pretrained_model_name_or_path="xvjiarui/IMProv-v1-0")
+    model = prepare_model(args.ckpt, arch=args.model)
+
+    _ = improv.to(args.device)
     _ = model.to(args.device)
 
 
@@ -167,61 +174,53 @@ def evaluate(args):
         support_name = ds[idx]['support_name']
 
         
-        
         for i in range(len(canvas)):
 
-            if captions[i] == "uncolor" or captions[i] == 'inpaint double random':
+            if captions[i] != "segmentation":
                 continue
 
-            og_holder = []
-            gen_holder = []
+            image_holder = []
+            label_holder = []
 
             
-            curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            model_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            improv_canvas = canvas[i]
 
-            text_prompt = ""
+            text_prompt = best_prompts[i]
 
-            if args.model == "improv":
-                curr_canvas = canvas[i]
-                text_prompt = best_prompts[i]
+            improv_original_image, improv_generated_result, improv_latents = _generate_result_for_canvas(args, improv, improv_canvas, input_prompts = text_prompt, model_type="improv")
+            model_original_image, model_generated_result, model_latents = _generate_result_for_canvas(args, model, model_canvas, model_type="model")
 
-            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, input_prompts = text_prompt)
-            curr_canvas = canvas[i].clone().detach()
-            midpoint = curr_canvas.shape[2] // 2
-            left_half = curr_canvas[:, :, :midpoint]
-            curr_canvas[:, :, midpoint:] = left_half
+            improv_canvas = canvas[i].clone().detach()
+            midpoint = improv_canvas.shape[2] // 2
+            left_half = improv_canvas[:, :, :midpoint]
+            improv_canvas[:, :, midpoint:] = left_half
 
-            if args.model != "improv":
-                curr_canvas = (curr_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            model_canvas = (improv_canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
 
-            og2, gen2, latents_neutral = _generate_result_for_canvas(args, model, curr_canvas,  input_prompts = nc_best_prompt)
+            improv_og2, improv_gen2, improv_latents_neutral = _generate_result_for_canvas(args, improv, improv_canvas,  input_prompts = nc_best_prompt, model_type="improv")
+            model_og2, model_gen2, model_latents_neutral = _generate_result_for_canvas(args, model, model_canvas, model_type="model")
 
+            for latent_i in range(len(improv_latents)):
+                improv_latents[latent_i] = improv_latents[latent_i] - improv_latents_neutral[latent_i]
+
+            for latent_i in range(len(model_latents)):
+                model_latents[latent_i] = model_latents[latent_i] - model_latents_neutral[latent_i]
             
+            image_holder.append(improv_original_image)
+            label_holder.append("Ground Truth Task")
+            image_holder.append(improv_og2)
+            label_holder.append("Ground Truth Neutral")
 
-            for index in range(len(latents)):
-                latents[index] = latents[index] - latents_neutral[index]
-                
-            og_holder.append(original_image)
-            gen_holder.append(generated_result)
+            image_holder.append(improv_generated_result)
+            label_holder.append("Improv Task Genereation")
+            image_holder.append(improv_gen2)
+            label_holder.append("Improv Neutral Genereation")
 
-            og_holder.append(og2)
-            gen_holder.append(gen2)
-
-                
-            if i == 0:
-                metric = segmentation_iou = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 1:
-                metric = colorization_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 2:
-                metric = neutral_copy_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 3:
-                metric = bw_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 4:
-                metric = lowlight_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 5:
-                metric = inpaint1_mse = evaluate_mse(original_image, generated_result, args)["mse"]
-            if i == 6:
-                metric = inpaint2_mse = evaluate_mse(original_image, generated_result, args)["mse"]
+            image_holder.append(model_generated_result)
+            label_holder.append("MAE-VQGAN Task Genereation")
+            image_holder.append(model_gen2)
+            label_holder.append("MAE-VQGAN Neutral Genereation")
 
             with open(os.path.join(args.output_dir, 'log.txt'), 'a') as log:
                 current_metric = {}
@@ -229,40 +228,54 @@ def evaluate(args):
                 current_metric["support_name"] = support_name
                 current_metric["task"] = captions[i]
                 current_metric["prompt"] = text_prompt
-                current_metric["metric"] = metric
-                current_metric["copymetric"] = evaluate_mse(og2, gen2, args)["mse"]
-                if i == 0:
-                    h = evaluate_segmentation(original_image, generated_result, args)
-                    current_metric["iou"] = h["iou"]
-                    current_metric["accuracy"] = h["accuracy"]
+                current_metric["split"] = args.split
+
+                current_metric["improv_metric"] = evaluate_mse(improv_original_image, improv_generated_result, args)["mse"]
+                current_metric["improv_copymetric"] = evaluate_mse(improv_og2, improv_gen2, args)["mse"]\
+                
+                current_metric["model_metric"] = evaluate_mse(model_original_image, model_generated_result, args)["mse"]
+                current_metric["model_copymetric"] = evaluate_mse(model_og2, model_gen2, args)["mse"]
+                
+                improv_h = evaluate_segmentation(improv_original_image, improv_generated_result, args)
+                current_metric["improv_iou"] = improv_h["iou"]
+                current_metric["improv_accuracy"] = improv_h["accuracy"]
+
+                model_h = evaluate_segmentation(model_original_image, model_generated_result, args)
+                current_metric["model_iou"] = model_h["iou"]
+                current_metric["model_accuracy"] = model_h["accuracy"]
 
                 log.write(str(current_metric) + '\n')
-            
+
             if args.store_latents:
                 try:
-                    write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i], metric)
+                    write_latent(args.store_latents, f'{query_name}___{support_name}', improv_latents, captions[i]+"_improv", current_metric["improv_iou"], model_type="improv")
                 except Exception as e:
+                    import pdb; breakpoint()
+                    print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
+                
+                try:
+                    write_latent(args.store_latents, f'{query_name}___{support_name}', model_latents, captions[i]+"_model", current_metric["model_iou"], model_type="model")
+                except Exception as e:
+                    import pdb; breakpoint()
                     print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
             
             if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
             
-                og_holder = [np.array(img) for img in og_holder]
-                gen_holder = [np.array(img) for img in gen_holder]
+                image_holder = [np.array(img) for img in image_holder]
 
-                fig, axs = plt.subplots(2, 2, figsize=(8, 8))
+                fig, axs = plt.subplots(3, 2, figsize=(8, 12))  # Adjusted to 3 rows and 2 columns
 
-                for index in range(2):
-                    axs[0, index].imshow(og_holder[index])
-                    axs[0, index].axis('off')  # Turn off axis
-
-                    axs[1, index].imshow(gen_holder[index])
-                    axs[1, index].axis('off')  # Turn off axis
+                for index in range(6):  # Adjusted to loop over 6 images
+                    row = index // 2  # Determine row for subplot
+                    col = index % 2  # Determine column for subplot
+                    axs[row, col].imshow(image_holder[index])
+                    axs[row, col].axis('off')  # Turn off axis
+                    axs[row, col].set_title(label_holder[index])  # Add label under each image
 
                 plt.tight_layout()
                 plt.subplots_adjust(bottom=0.1)  # Adjust as needed
-                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}_{captions[i]}.png'))
+                plt.savefig(os.path.join(args.output_dir, f'{args.split}combined_{idx}_{captions[i]}.png'))
                 plt.show()
-
  
 def evaluate_segmentation(original_image, generated_result, args):
     if args.purple:

@@ -12,7 +12,7 @@ import random
 
 class DatasetPASCAL(Dataset):
     def __init__(self, datapath, fold, image_transform, mask_transform, padding: bool = 1, use_original_imgsize: bool = False, flipped_order: bool = False,
-                 reverse_support_and_query: bool = False, random: bool = False, ensemble: bool = False, purple: bool = False, query_support_list_file=None, iters=1000):
+                 reverse_support_and_query: bool = False, random: bool = False, ensemble: bool = False, purple: bool = False, query_support_list_file=None, iters=1000, avoid_list=None):
         self.fold = fold
         self.nfolds = 4
         self.flipped_order = flipped_order
@@ -26,9 +26,14 @@ class DatasetPASCAL(Dataset):
         self.iters = iters
 
         self.query_support_list_file = query_support_list_file
+        self.avoid_list = avoid_list
         if query_support_list_file is not None:
             with open(query_support_list_file, 'r') as file:
                 self.query_support_pairs = json.load(file)
+
+        if avoid_list is not None:
+            with open(avoid_list, 'r') as file:
+                self.avoid_pairs = json.load(file)
 
         self.img_path = os.path.join(datapath, 'VOCdevkit/VOC2012/JPEGImages/')
         self.ann_path = os.path.join(datapath, 'VOCdevkit/VOC2012/SegmentationClassAug/')
@@ -142,9 +147,21 @@ class DatasetPASCAL(Dataset):
             fold_n_metadata = [[data.split('__')[0], int(data.split('__')[1]) - 1] for data in fold_n_metadata]
             return fold_n_metadata
 
+
         img_metadata = []
-        img_metadata = read_metadata('val', self.fold)
-       
+
+        if self.query_support_list_file is not None:
+            img_metadata = read_metadata('val', 0) + read_metadata('val',1) + read_metadata('val', 2) + read_metadata('val', 3)
+        else:
+            img_metadata = read_metadata('val', self.fold)
+
+            if self.avoid_list is not None:
+                print("Before Filter", len(img_metadata))
+                img_metadata = [ele for ele in img_metadata if ele[0] not in [item["query_name"] for item in self.avoid_pairs]]
+                img_metadata = [ele for ele in img_metadata if ele[0] not in [item["support_name"] for item in self.avoid_pairs]]
+                print("After Filter", len(img_metadata))
+                
+        
         print('Total (val) images are : %d' % len(img_metadata))
 
         return img_metadata

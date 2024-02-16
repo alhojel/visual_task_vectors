@@ -111,9 +111,9 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16', device='cpu'):
 
 
 @torch.no_grad()
-def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu', convex = "False", drop_indices=None, premask_pass_indices = None, postmask_pass_indices = None, bottleneck_injection = None, prompt_skip = None, position = None, attention_heads=None, attention_injection=None, replace=1, abalate=False, a_e_attention_injection=None, a_d_attention_injection=None):
+def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu', convex = "False", drop_indices=None, premask_pass_indices = None, postmask_pass_indices = None, bottleneck_injection = None, prompt_skip = None, position = None, attention_heads=None, attention_injection=None, replace=0, abalate=False, a_e_attention_injection=None, a_d_attention_injection=None, record=True):
     """ids_shuffle is [bs, 196]"""
-    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, abalate, a_e_attention_injection, a_d_attention_injection)
+    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, abalate, a_e_attention_injection, a_d_attention_injection, record)
     num_patches = 14
     y = x.argmax(dim=-1)
     im_paste, mask, orig_image = decode_raw_predicion(mask, model, num_patches, orig_image, y)
@@ -141,8 +141,7 @@ def decode_raw_predicion(mask, model, num_patches, orig_image, y):
 
 
 @torch.no_grad()
-def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, abalate, a_e_attention_injection, a_d_attention_injection):
-    import pdb; breakpoint()
+def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, abalate, a_e_attention_injection, a_d_attention_injection, record):
     latents_holder = []
     ids_shuffle = ids_shuffle.to(device)
     # make it a batch-like
@@ -180,15 +179,15 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     # apply Transformer blocks
     for block_num, blk in enumerate(model.blocks):
         if abalate:
-            latent, separate = blk(latent, "all", a_e_attention_injection[block_num], abalate=abalate)
+            latent, separate = blk(latent, "all", a_e_attention_injection[block_num], abalate=abalate, record=record)
         else:
-            if attention_heads is not None and block_num == attention_heads[0]:
+            if attention_heads is not None and attention_heads.shape[0]!=0 and block_num in attention_heads[:,0]:
                 if attention_injection is not None:
-                    latent, separate = blk(latent, attention_heads[1], attention_injection[block_num], replace)
+                    latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], attention_injection[0][block_num], replace, record=record)
                 else:
-                    latent, separate = blk(latent, attention_heads[1])
+                    latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], record=record)
             else:
-                latent, separate = blk(latent)
+                latent, separate = blk(latent, record=record)
         if e_vec is not None:
             assert e_vec.shape[1] == 148
             if convex is not False or convex == 0:
@@ -199,7 +198,9 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
                 latent[0] = latent[0] + e_vec[block_num]
 
         #latents_holder.append(latent.detach().cpu().numpy())
-        latents_holder.append(separate.detach().cpu().numpy())
+        
+        if record:
+            latents_holder.append(separate.detach().cpu().numpy())
         
     latent = model.norm(latent)
     x = model.decoder_embed(latent)
@@ -273,23 +274,54 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
 
         x_temp = (attn @ v).transpose(1, 2)
 
-        latents_holder.append(x_temp.detach().cpu().numpy())
+        separated_heads = x_temp
+
+        if record:
+            new_sep_heads = torch.zeros(B, N, 16, C).to(device=x_temp.device)
+
+            for i in range(separated_heads.shape[2]):
+                holder = torch.zeros(separated_heads.shape).to(device=x_temp.device)
+                holder[:,:,i,:] = separated_heads[:,:,i,:]
+                holder = holder.reshape(B, N, C)
+                new_sep_heads[:,:,i] = blk.attn.proj(holder)
+        
+            latents_holder.append(new_sep_heads.detach().cpu().numpy())
 
         if abalate:
             x_temp[0,:,:,:] = replace*x_temp[0,:,:,:] + a_d_attention_injection[block_num][:,:,:]
-        else:
-            if attention_heads is not None and block_num+24 == attention_heads[0]:
-                if attention_injection is not None:
-                    assert x_temp[0,:,attention_heads[1],:].shape == attention_injection[block_num][:,attention_heads[1],:].shape, (x_temp[0,:,attention_heads[1],:].shape, attention_injection[block_num][:,attention_heads[1],:].shape)
-                    x_temp[0,:,attention_heads[1],:] = replace*x_temp[0,:,attention_heads[1],:] + attention_injection[block_num][:,attention_heads[1],:]
+        else:                
+            if attention_heads is not None and attention_heads.shape[0]!=0 and block_num+24 in attention_heads[:,0]:
+                att = attention_heads[attention_heads[:,0]==block_num+24][:,1:]
+                if att.shape[1] == 1:
+                    x_temp[:, :, att[:, 0], :] = 0
                 else:
-                    x_temp[:,:,attention_heads[1],:] = 0
+                    x_temp[:, att[:, 1], att[:, 0], :] = 0
+                    
 
         x_temp = x_temp.reshape(B, N, C)
-        x_temp = blk.attn.proj(x_temp)
+        x_temp = torch.matmul(x_temp, blk.attn.proj.weight.T) 
+        
+        if attention_injection is not None and attention_heads.shape[0]!=0 and block_num+24 in attention_heads[:,0]:
+            if att.shape[1] == 1:
+                assert x_temp[0].shape == attention_injection[1][block_num][:,att[:, 0],:].sum(1).shape, (x[0].shape, attention_injection[1][block_num][:,att[:, 0],:].sum(1).shape)
+                x_temp[0] = x_temp[0] + attention_injection[1][block_num][:,att[:, 0],:].sum(1) - blk.attn.proj.bias*att[:, 0].shape[0]
+            else:
+                assert x_temp[0,att[:, 1]].shape == attention_injection[1][block_num][att[:, 1],att[:, 0],:].shape, (x_temp[0,att[:, 1]].shape, attention_injection[1][block_num][att[:, 1],att[:, 0],:].shape)
+                
+                changes = attention_injection[1][block_num][att[:, 1], att[:, 0], :] - blk.attn.proj.bias
+                index_tensor = att[:, 1].unsqueeze(1)
+                
+                x_temp[0].scatter_add_(0, index_tensor.expand(-1, 512), changes)
+                #for token in range(len(att[:, 1])):
+                #    x_temp[0,att[:, 1][token]] = x_temp[0,att[:, 1][token]] + attention_injection[1][block_num][att[:, 1][token],att[:, 0][token],:] - blk.attn.proj.bias
+
+                #x_temp[0,att[:, 1]] = x_temp[0,att[:, 1]] + attention_injection[1][block_num][att[:, 1],att[:, 0],:] - blk.attn.proj.bias
+            
+        x_temp = x_temp + blk.attn.proj.bias
         x_temp = blk.attn.proj_drop(x_temp)
         # Here we continue to the orignal block.
         x = x + blk.drop_path(x_temp)
+    
 
         x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
         if d_vec is not None:
@@ -507,6 +539,7 @@ def generate_decoder_attention_maps(orig_image, model, ids_shuffle, len_keep, in
     # make it a batch-like
     orig_image = convert_to_tensor(orig_image).to(device)
     temp_x = orig_image.clone().detach().to(device)
+
 
     # embed patches
     latent = model.patch_embed(temp_x.float())

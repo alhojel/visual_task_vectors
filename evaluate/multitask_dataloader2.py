@@ -37,7 +37,6 @@ class DatasetPASCAL(Dataset):
 
         self.img_path = os.path.join(datapath, 'VOCdevkit/VOC2012/JPEGImages/')
         self.ann_path = os.path.join(datapath, 'VOCdevkit/VOC2012/SegmentationClassAug/')
-        self.ann_path2 = os.path.join(datapath, 'VOCdevkit/VOC2012/SegmentationClass/')
         self.image_transform = image_transform
         self.reverse_support_and_query = reverse_support_and_query
         self.mask_transform = mask_transform
@@ -73,11 +72,11 @@ class DatasetPASCAL(Dataset):
 
         grid.append(self.segmentation_grid(query_img, query_cmask, support_img, support_cmask, class_sample_query, class_sample_support))
         grid.append(self.colorization_grid(query_img, support_img))
-        #grid.append(self.neutral_copy_grid(query_img, support_img))
-        grid.append(self.bw_grid(query_img, support_img))
         grid.append(self.lowlight_grid(query_img, support_img))
         grid.append(self.inpaint_black_grid(query_img, support_img, r=1))
-        grid.append(self.inpaint_black_grid(query_img, support_img, r=2))
+        grid.append(self.color_channel(query_img, support_img, 0))
+        grid.append(self.color_channel(query_img, support_img, 1))
+        grid.append(self.color_channel(query_img, support_img, 2))
         
         batch = {'query_name': query_name,
                  'support_name': support_name,
@@ -113,10 +112,7 @@ class DatasetPASCAL(Dataset):
 
     def read_mask(self, img_name):
         r"""Return segmentation mask in PIL Image"""
-        try:
-            mask = Image.open(os.path.join(self.ann_path, img_name) + '.png')
-        except:
-            mask = Image.open(os.path.join(self.ann_path2, img_name) + '.png')
+        mask = Image.open(os.path.join(self.ann_path, img_name) + '.png')
         return mask
 
     def read_img(self, img_name):
@@ -251,21 +247,26 @@ class DatasetPASCAL(Dataset):
 
         return canvas
     
-    def neutral_copy_grid(self, query_img, support_img):
+    def color_channel(self, query_img, support_img, channel):
         
         query_img = self.image_transform(query_img)
         support_img = self.image_transform(support_img)
-        grid = self.create_grid_from_images_colorization(support_img, support_img, query_img, query_img)
+        q2 = query_img.clone()
+        s2 = support_img.clone()
+
+        other_channels = [0, 1, 2]
+        other_channels.remove(channel)
+        
+        q2[channel] = torch.norm(q2, dim=0)
+        q2[other_channels] = 0
+
+        s2[channel] = torch.norm(s2, dim=0)
+        s2[other_channels] = 0
+
+        grid = self.create_grid_from_images_colorization(support_img, s2, query_img, q2)
         
         return grid
     
-    def bw_grid(self, query_img, support_img):
-        
-        query_mask, query_img = self.mask_transform[1](query_img), self.image_transform(query_img)
-        support_mask, support_img = self.mask_transform[1](support_img), self.image_transform(support_img)
-        grid = self.create_grid_from_images_colorization(support_img, support_mask, query_img, query_mask)
-        
-        return grid
     
     def inpaint_black_grid(self, query_img, support_img, r=0):
         

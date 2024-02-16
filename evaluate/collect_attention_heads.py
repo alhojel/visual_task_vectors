@@ -1,6 +1,6 @@
 import os.path
 from tqdm import trange
-import multitask_dataloader
+import multitask_dataloader2
 from evaluate_detection.box_ops import to_rectangle
 from evaluate_detection.canvas_ds import CanvasDataset
 from reasoning_dataloader import *
@@ -82,7 +82,7 @@ def _generate_result_for_canvas(args, model, canvas, premask_pass_indices = None
 
     ids_shuffle, len_keep = generate_mask_for_evaluation()
     _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
-                                    len_keep, device=args.device, attention_heads = attention_heads)
+                                    len_keep, device=args.device)
 
     canvas = torch.einsum('chw->hwc', canvas)
     canvas = torch.clip((canvas.cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int().numpy()
@@ -90,8 +90,6 @@ def _generate_result_for_canvas(args, model, canvas, premask_pass_indices = None
     return np.uint8(canvas), np.uint8(im_paste), latents
 
 def evaluate(args):
-    with open(os.path.join(args.output_dir, 'log.txt'), 'w') as log:
-        log.write(str(args) + '\n')
     padding = 1
     image_transform = torchvision.transforms.Compose(
         [torchvision.transforms.Resize((224 // 2 - padding, 224 // 2 - padding), 3),
@@ -103,21 +101,20 @@ def evaluate(args):
          torchvision.transforms.Grayscale(3),
          torchvision.transforms.ToTensor()])]
 
-    ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
+    ds = multitask_dataloader2.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
                          flipped_order=args.flip, purple=args.purple, query_support_list_file=args.query_support_list_file, iters=args.iters)
     
     model = prepare_model(args.ckpt, arch=args.model)
     _ = model.to(args.device)
 
     captions_subset = ["segmentation", "colorization", "lowlight enhance", "inpaint single random"]
-    captions = ["segmentation", "colorization", "uncolor", "lowlight enhance", "inpaint single random", "inpaint double random"]
+    captions = ["segmentation", "colorization", "lowlight enhance", "inpaint single random", "reddify", "greenify", "blueify"]
 
     for idx in trange(len(ds)):
         canvas = ds[idx]['grid']
 
         query_name = ds[idx]['query_name']
         support_name = ds[idx]['support_name']
-
         
         for i in range(len(canvas)):
 
@@ -133,7 +130,7 @@ def evaluate(args):
                 except Exception as e:
                     print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
             
-
+            
             curr_canvas = canvas[i].clone().detach()
             midpoint = curr_canvas.shape[2] // 2
             left_half = curr_canvas[:, :, :midpoint]
@@ -141,13 +138,14 @@ def evaluate(args):
 
             og2, gen2, latents = _generate_result_for_canvas(args, model, curr_canvas)
 
-            
+        
             if args.store_latents:
                 try:
                     write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i]+"_neutral")
                 except Exception as e:
                     print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
             
+
 if __name__ == '__main__':
     args = get_args()
 

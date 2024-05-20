@@ -4,6 +4,8 @@ import numpy as np
 import matplotlib.patches as patches_plt
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
+import torch.nn as nn
+
 import os
 import sys
 cwd = os.path.dirname(os.path.abspath(__file__))
@@ -111,42 +113,58 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16', device='cpu'):
 
 
 @torch.no_grad()
-def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu', convex = "False", drop_indices=None, premask_pass_indices = None, postmask_pass_indices = None, bottleneck_injection = None, prompt_skip = None, position = None, attention_heads=None, attention_injection=None, replace=0, abalate=False, a_e_attention_injection=None, a_d_attention_injection=None, record=True):
+def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu', convex = "False", drop_indices=None, premask_pass_indices = None, postmask_pass_indices = None, bottleneck_injection = None, prompt_skip = None, position = None, attention_heads=None, attention_injection=None, replace=0, abalate=False, a_e_attention_injection=None, a_d_attention_injection=None, record=True, replace_tokens=False):
     """ids_shuffle is [bs, 196]"""
-    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, abalate, a_e_attention_injection, a_d_attention_injection, record)
+    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, a_e_attention_injection, a_d_attention_injection, record, replace_tokens)
     num_patches = 14
     y = x.argmax(dim=-1)
-    im_paste, mask, orig_image = decode_raw_predicion(mask, model, num_patches, orig_image, y)
-    return orig_image, im_paste[0], mask, latents
+    
+    im_paste, mask, orig_image, loss = decode_raw_predicion(mask, model, num_patches, orig_image, y, x)
+    return orig_image, im_paste[0], mask, latents, loss
 
 
-def decode_raw_predicion(mask, model, num_patches, orig_image, y):
+def decode_raw_predicion(mask, model, num_patches, orig_image, y, x):
+    if y.shape[-1] == 98:
+        y = torch.hstack([y,y])
+    if x.shape[-2] == 98:
+        x = torch.hstack([x,x])
+        
+    with torch.no_grad():
+        target = model.vae.get_codebook_indices(orig_image.float()).flatten(1)
+    loss = nn.CrossEntropyLoss(reduction='none')(input=x.permute(0, 2, 1), target=target)
+    loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
+
+    log_probs = F.log_softmax(x, dim=-1)
+    target = target.unsqueeze(-1)  # Shape: (1, 196, 1)
+    target_log_probs = log_probs.gather(dim=-1, index=target).squeeze(-1)  # Shape: (1, 196)
+    nll_loss = -(target_log_probs * mask).sum() / mask.sum()
+    
     y = model.vae.quantize.get_codebook_entry(y.reshape(-1),
                                               [y.shape[0], y.shape[-1] // num_patches, y.shape[-1] // num_patches, -1])
     y = model.vae.decode(y)
     # plt.figure(); plt.imshow(y[0].permute(1,2,0)); plt.show()
     y = F.interpolate(y, size=(224, 224), mode='bilinear').permute(0, 2, 3, 1)
-    y = torch.clip(y * 255, 0, 255).int().detach().cpu()
+    y = torch.clip(y * 255, 0, 255).int()
     # visualize the mask
     mask = mask.unsqueeze(-1).repeat(1, 1, model.patch_embed.patch_size[0] ** 2 * 3)
     mask = model.unpatchify(mask)  # 1 is removing, 0 is keeping
-    mask = torch.einsum('nchw->nhwc', mask).detach().cpu()
+    mask = torch.einsum('nchw->nhwc', mask)
     orig_image = torch.einsum('nchw->nhwc', orig_image)
     orig_image = (
-        torch.clip((orig_image[0].cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int()).unsqueeze(0)
+        torch.clip((orig_image[0]* torch.tensor(imagenet_std).to(orig_image.device) + torch.tensor(imagenet_mean).to(orig_image.device)) * 255, 0, 255).int()).unsqueeze(0)
     # MAE reconstruction pasted with visible patches
     
     im_paste = orig_image * (1 - mask) + y * mask
-    return y, mask, orig_image
+    return y, mask, orig_image, nll_loss
 
 
 @torch.no_grad()
-def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, abalate, a_e_attention_injection, a_d_attention_injection, record):
+def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, a_e_attention_injection, a_d_attention_injection, record, replace_tokens):
     latents_holder = []
     ids_shuffle = ids_shuffle.to(device)
     # make it a batch-like
     orig_image = convert_to_tensor(orig_image).to(device)
-    temp_x = orig_image.clone().detach().to(device)
+    temp_x = orig_image.clone().to(device)
     # RUN ENCODER:
     # embed patches
     latent = model.patch_embed(temp_x.float())
@@ -175,29 +193,18 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     #encoder_pass_indices
     if premask_pass_indices is not None:
         latent = torch.index_select(latent, dim=1, index=torch.tensor(premask_pass_indices, device=latent.device))
-
+        #import pdb; breakpoint()
+    
     # apply Transformer blocks
     for block_num, blk in enumerate(model.blocks):
-        if abalate:
-            latent, separate = blk(latent, "all", a_e_attention_injection[block_num], abalate=abalate, record=record)
+        
+        if attention_heads is not None and attention_heads.shape[0]!=0 and block_num in attention_heads[:,0]:
+            if attention_injection is not None:
+                latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], attention_injection[0][block_num], replace_tokens, record=record, zero_shot=premask_pass_indices is not None)
+            else:
+                latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], record=record, zero_shot=premask_pass_indices is not None)
         else:
-            if attention_heads is not None and attention_heads.shape[0]!=0 and block_num in attention_heads[:,0]:
-                if attention_injection is not None:
-                    latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], attention_injection[0][block_num], replace, record=record)
-                else:
-                    latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], record=record)
-            else:
-                latent, separate = blk(latent, record=record)
-        if e_vec is not None:
-            assert e_vec.shape[1] == 148
-            if convex is not False or convex == 0:
-                assert latent[0].shape == e_vec[block_num].shape
-                latent[0] = (1-convex)*latent[0] + convex*e_vec[block_num]
-            else:
-                assert latent[0].shape == e_vec[block_num].shape
-                latent[0] = latent[0] + e_vec[block_num]
-
-        #latents_holder.append(latent.detach().cpu().numpy())
+            latent, separate = blk(latent, record=record)
         
         if record:
             latents_holder.append(separate.detach().cpu().numpy())
@@ -235,16 +242,6 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
     # add pos embed
 
-  
-
-    if bottleneck_injection is not None:
-        assert bottleneck_injection.shape == x.shape, (bottleneck_injection.shape, x.shape)
-        assert prompt_skip[:,postmask_pass_indices,:].shape == x[:,postmask_pass_indices,:].shape, (prompt_skip[:,postmask_pass_indices,:].shape, x.shape)
-        prompt_skip[:,postmask_pass_indices,:] = x[:,postmask_pass_indices,:]
-        if position == "neck":
-            prompt_skip = prompt_skip + bottleneck_injection
-        x = prompt_skip
-
     #latents_holder.append(x.detach().cpu().numpy())
 
     x = x + model.decoder_pos_embed
@@ -252,6 +249,7 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     # apply Transformer blocks
 
     # Drop the indices in drop_indices across dim=1 and store them in a new tensor
+    
     if drop_indices is not None:
         #  Temporary holder
         #holder = torch.index_select(x, dim=1, index=torch.tensor(np.array(drop_indices)).to(x.device))
@@ -259,109 +257,36 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
         x = torch.index_select(x, dim=1, index=torch.tensor([i for i in range(x.size(1)) if i not in drop_indices], device=latent.device))
     
     for block_num, blk in enumerate(model.decoder_blocks):
-        # Here is unrollment of the decoder blocks:
-        x_temp = blk.norm1(x)
-        # here is an unrollment of the attention mechanism:
-        B, N, C = x_temp.shape
-        qkv = blk.attn.qkv(x_temp).reshape(
-            B, N, 3, blk.attn.num_heads, C // blk.attn.num_heads).permute(2, 0, 3, 1, 4)
-        # make torchscript happy (cannot use tensor as tuple)
-        q, k, v = qkv.unbind(0)
-        attn = (q @ k.transpose(-2, -1)) * blk.attn.scale
-        # The attention shape is [1, 16, 197, 197]
-        # This is where our code comes to mind:
-        attn = attn.softmax(dim=-1)
-
-        x_temp = (attn @ v).transpose(1, 2)
-
-        separated_heads = x_temp
-
+        if attention_heads is not None and attention_heads.shape[0]!=0 and block_num+24 in attention_heads[:,0]:
+            if attention_injection is not None:
+                x, separate = blk(x, attention_heads[attention_heads[:,0]==block_num+24][:,1:], attention_injection[1][block_num], replace_tokens, record=record, zero_shot=premask_pass_indices is not None)
+            else:
+                x, separate = blk(x, attention_heads[attention_heads[:,0]==block_num+24][:,1:], record=record, zero_shot=premask_pass_indices is not None)
+        else:
+            x, separate = blk(x, record=record)
+        
         if record:
-            new_sep_heads = torch.zeros(B, N, 16, C).to(device=x_temp.device)
-
-            for i in range(separated_heads.shape[2]):
-                holder = torch.zeros(separated_heads.shape).to(device=x_temp.device)
-                holder[:,:,i,:] = separated_heads[:,:,i,:]
-                holder = holder.reshape(B, N, C)
-                new_sep_heads[:,:,i] = blk.attn.proj(holder)
-        
-            latents_holder.append(new_sep_heads.detach().cpu().numpy())
-
-        if abalate:
-            x_temp[0,:,:,:] = replace*x_temp[0,:,:,:] + a_d_attention_injection[block_num][:,:,:]
-        else:                
-            if attention_heads is not None and attention_heads.shape[0]!=0 and block_num+24 in attention_heads[:,0]:
-                att = attention_heads[attention_heads[:,0]==block_num+24][:,1:]
-                if att.shape[1] == 1:
-                    x_temp[:, :, att[:, 0], :] = 0
-                else:
-                    x_temp[:, att[:, 1], att[:, 0], :] = 0
-                    
-
-        x_temp = x_temp.reshape(B, N, C)
-        x_temp = torch.matmul(x_temp, blk.attn.proj.weight.T) 
-        
-        if attention_injection is not None and attention_heads.shape[0]!=0 and block_num+24 in attention_heads[:,0]:
-            if att.shape[1] == 1:
-                assert x_temp[0].shape == attention_injection[1][block_num][:,att[:, 0],:].sum(1).shape, (x[0].shape, attention_injection[1][block_num][:,att[:, 0],:].sum(1).shape)
-                x_temp[0] = x_temp[0] + attention_injection[1][block_num][:,att[:, 0],:].sum(1) - blk.attn.proj.bias*att[:, 0].shape[0]
-            else:
-                assert x_temp[0,att[:, 1]].shape == attention_injection[1][block_num][att[:, 1],att[:, 0],:].shape, (x_temp[0,att[:, 1]].shape, attention_injection[1][block_num][att[:, 1],att[:, 0],:].shape)
-                
-                changes = attention_injection[1][block_num][att[:, 1], att[:, 0], :] - blk.attn.proj.bias
-                index_tensor = att[:, 1].unsqueeze(1)
-                
-                x_temp[0].scatter_add_(0, index_tensor.expand(-1, 512), changes)
-                #for token in range(len(att[:, 1])):
-                #    x_temp[0,att[:, 1][token]] = x_temp[0,att[:, 1][token]] + attention_injection[1][block_num][att[:, 1][token],att[:, 0][token],:] - blk.attn.proj.bias
-
-                #x_temp[0,att[:, 1]] = x_temp[0,att[:, 1]] + attention_injection[1][block_num][att[:, 1],att[:, 0],:] - blk.attn.proj.bias
+            latents_holder.append(separate.detach().cpu().numpy())
             
-        x_temp = x_temp + blk.attn.proj.bias
-        x_temp = blk.attn.proj_drop(x_temp)
-        # Here we continue to the orignal block.
-        x = x + blk.drop_path(x_temp)
-    
-
-        x = x + blk.drop_path(blk.mlp(blk.norm2(x)))
-        if d_vec is not None:
-            if convex != "False":
-                assert x.shape == d_vec[block_num].shape, (x.shape , d_vec[block_num].shape)
-                d_vec_norm = torch.norm(d_vec[block_num], dim=-1, keepdim=True)
-                convex_mask = d_vec_norm != 0
-                convex_mask = convex_mask.squeeze(0,-1)
-                assert d_vec[block_num][:,convex_mask].shape == x[:,convex_mask].shape, (d_vec[block_num][:,convex_mask].shape , x[:,convex_mask].shape,)
-                x[:,convex_mask] = (1-convex)*x[:,convex_mask] + convex*d_vec[block_num][:,convex_mask]
-            else:
-                assert x.shape == d_vec[block_num].shape, (x.shape , d_vec[block_num].shape)
-                x = x + d_vec[block_num]
-
-        #latents_holder.append(x.detach().cpu().numpy())
-            
-        if block_num == 0:
-            if bottleneck_injection is not None and position == "decoder":
-                assert bottleneck_injection.shape == x.shape, (bottleneck_injection.shape, x.shape)
-                x = x + bottleneck_injection
-            #latents_holder.append(x.detach().cpu().numpy())
-
     x = model.decoder_norm(x)
     # predictor projection
     x = model.decoder_pred(x)
 
-    if drop_indices is not None:
-        # Re-insert zeros at the positions indicated by drop_indices
-        N, L, D = x.shape
-        # Create a tensor of zeros to insert
-        zeros_to_insert = torch.zeros(N, len(drop_indices), D, device=x.device)
-        # Calculate the indices for the non-dropped elements
-        non_dropped_indices = [i for i in range(L + len(drop_indices)) if i not in drop_indices]
-        # Create a new tensor that will hold the result with zeros inserted
-        x_reconstructed = torch.zeros(N, L + len(drop_indices), D, device=x.device)
-        # Insert the non-dropped elements into the reconstructed tensor
-        x_reconstructed[:, non_dropped_indices, :] = x
-        # Insert the zeros into the reconstructed tensor at the positions of drop_indices
-        x_reconstructed[:, drop_indices, :] = zeros_to_insert
-        x = x_reconstructed
+    # if drop_indices is not None:
+    #     # Re-insert zeros at the positions indicated by drop_indices
+    #     N, L, D = x.shape
+    #     # Create a tensor of zeros to insert
+    #     zeros_to_insert = torch.zeros(N, len(drop_indices), D, device=x.device)
+    #     zeros_to_insert[:,:] = x[:,1,:]
+    #     # Calculate the indices for the non-dropped elements
+    #     non_dropped_indices = [i for i in range(L + len(drop_indices)) if i not in drop_indices]
+    #     # Create a new tensor that will hold the result with zeros inserted
+    #     x_reconstructed = torch.zeros(N, L + len(drop_indices), D, device=x.device)
+    #     # Insert the non-dropped elements into the reconstructed tensor
+    #     x_reconstructed[:, non_dropped_indices, :] = x
+    #     # Insert the zeros into the reconstructed tensor at the positions of drop_indices
+    #     x_reconstructed[:, drop_indices, :] = zeros_to_insert
+    #     x = x_reconstructed
 
     # remove cls token
     x = x[:, 1:, :]

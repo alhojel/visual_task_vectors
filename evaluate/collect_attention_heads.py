@@ -1,6 +1,6 @@
 import os.path
 from tqdm import trange
-import multitask_dataloader2
+import multitask_dataloader
 from evaluate_detection.box_ops import to_rectangle
 from evaluate_detection.canvas_ds import CanvasDataset
 from reasoning_dataloader import *
@@ -101,13 +101,13 @@ def evaluate(args):
          torchvision.transforms.Grayscale(3),
          torchvision.transforms.ToTensor()])]
 
-    ds = multitask_dataloader2.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
+    ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
                          flipped_order=args.flip, purple=args.purple, query_support_list_file=args.query_support_list_file, iters=args.iters)
     
     model = prepare_model(args.ckpt, arch=args.model)
     _ = model.to(args.device)
 
-    captions_subset = ["segmentation", "colorization", "lowlight enhance", "inpaint single random"]
+    captions_subset = ["segmentation"]
     captions = ["segmentation", "colorization", "lowlight enhance", "inpaint single random", "reddify", "greenify", "blueify"]
 
     for idx in trange(len(ds)):
@@ -121,9 +121,12 @@ def evaluate(args):
             if captions[i] not in captions_subset:
                 continue
 
+            gen_holder = []
+
             curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
             original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, attention_heads=True)
-
+            gen_holder.append(original_image)
+            gen_holder.append(generated_result)
             if args.store_latents:
                 try:
                     write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i])
@@ -131,20 +134,26 @@ def evaluate(args):
                     print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
             
             
-            curr_canvas = canvas[i].clone().detach()
-            midpoint = curr_canvas.shape[2] // 2
-            left_half = curr_canvas[:, :, :midpoint]
-            curr_canvas[:, :, midpoint:] = left_half
+            if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
+                   
+                gen_holder = [np.array(img) for img in gen_holder]
 
-            og2, gen2, latents = _generate_result_for_canvas(args, model, curr_canvas)
-
-        
-            if args.store_latents:
-                try:
-                    write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i]+"_neutral")
-                except Exception as e:
-                    print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
-            
+                # Determine the number of images
+                num_images = len(gen_holder)
+                num_rows = 2  # Images distributed over two rows
+                num_cols = 1
+                fig_size = (num_cols * 2.2, num_rows * 2.5)  # Adjusted for vertical labels and reduced vertical spacing
+                fig, axs = plt.subplots(num_rows, num_cols, figsize=fig_size, squeeze=False)
+                
+                # Displaying each image in its own cell, left to right, top to bottom
+                for img_index, img in enumerate(gen_holder):
+                    row = img_index // num_cols
+                    col = img_index % num_cols
+                    axs[row, col].imshow(img)
+                    axs[row, col].axis('off')
+                
+                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}_{captions[i]}_1.png'))
+                plt.show() 
 
 if __name__ == '__main__':
     args = get_args()

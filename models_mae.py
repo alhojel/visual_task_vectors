@@ -268,7 +268,7 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, attention_head_drop = None, attention_head_injection = None, replace=1, abalate=False, record=True):
+    def forward(self, x, attention_head_drop = None, attention_head_injection = None, replace=1, zero_shot=False, record=True):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
@@ -279,14 +279,11 @@ class Attention(nn.Module):
 
         seperated_heads = (attn @ v).transpose(1, 2)
 
-        if abalate:
-            seperated_heads[0,:,:,:] = replace*seperated_heads[0,:,:,:] + attention_head_injection[:,:,:]
-        else:
-            if attention_head_drop is not None:
-                if attention_head_drop.shape[1] == 1:
-                    seperated_heads[:, :, attention_head_drop[:, 0], :] = 0
-                else:
-                    seperated_heads[:, attention_head_drop[:, 1], attention_head_drop[:, 0], :] = 0
+        if attention_head_drop is not None:
+            if attention_head_drop.shape[1] == 1:
+                seperated_heads[:, :, attention_head_drop[:, 0], :] = 0
+            else:
+                seperated_heads[:, attention_head_drop[:, 1], attention_head_drop[:, 0], :] = 0
 
         x = seperated_heads.reshape(B, N, C)
         x = torch.matmul(x, self.proj.weight.T) 
@@ -294,18 +291,31 @@ class Attention(nn.Module):
         if attention_head_drop is not None and attention_head_injection is not None:
 
             if attention_head_drop.shape[1] == 1:
+                import pdb; breakpoint()
                 assert x[0].shape == attention_head_injection[:,attention_head_drop[:, 0],:].sum(1).shape, (x[0].shape, attention_head_injection[:,attention_head_drop[:, 0],:].sum(1).shape)
                 x[0] = x[0] + attention_head_injection[:,attention_head_drop[:, 0],:].sum(1) - self.proj.bias*attention_head_drop[:, 0].shape[0]
             else:
-                assert x[0,attention_head_drop[:, 1]].shape == attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:].shape, (x[0,attention_head_drop[:, 1]].shape, attention_head_injection[:,attention_head_drop[:, 0],:].shape)
+
+                #Cuz indices are already good if zero_shot:
+                if zero_shot:
+                    attention_head_drop[:, 1] = torch.where(attention_head_drop[:, 1] != 0, attention_head_drop[:, 1] + 98, attention_head_drop[:, 1])
+
                 #or token in range(len(attention_head_drop[:, 1])):
-                
-                changes = attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:,0],:] - self.proj.bias
+                try:
+                    changes = attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:] - self.proj.bias
+                except:
+                    import pdb; breakpoint()
+
+                if zero_shot:
+                    attention_head_drop[:, 1] = torch.where(attention_head_drop[:, 1] != 0, attention_head_drop[:, 1] - 98, attention_head_drop[:, 1])
+
                 index_tensor = attention_head_drop[:, 1].unsqueeze(1)
-                x[0].scatter_add_(0, index_tensor.expand(-1, 1024), changes)
                 
-                
-                
+                x[0].scatter_add_(0, index_tensor.expand(-1, 512), changes)
+
+
+                assert x[0,attention_head_drop[:, 1]].shape == attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:].shape, (x[0,attention_head_drop[:, 1]].shape, attention_head_injection[:,attention_head_drop[:, 0],:].shape)
+                    
                 #x[0,attention_head_drop[:, 1]] = x[0,attention_head_drop[:, 1]] + attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:] - self.proj.bias
                         
         x = x + self.proj.bias
@@ -340,8 +350,41 @@ class Block(nn.Module):
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
 
-    def forward(self, x, attention_head_drop = None, attention_head_injection = None,replace=1, abalate=False, record=True):
-        combined, separated = self.attn(self.norm1(x), attention_head_drop, attention_head_injection, replace=replace, abalate=abalate, record=record)
+    def forward(self, x, attention_head_drop = None, attention_head_injection = None,replace=False, zero_shot=False, record=True):
+        #if replace is False:
+        combined, separated = self.attn(self.norm1(x), attention_head_drop, attention_head_injection, replace=replace, zero_shot=zero_shot, record=record)
         x = x + self.drop_path(combined)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
+        """ else:
+            combined, separated = self.attn(self.norm1(x), None, None, replace=replace, zero_shot=zero_shot, record=record)
+            x = x + self.drop_path(combined)
+            x = x + self.drop_path(self.mlp(self.norm2(x)))
+
+            if attention_head_drop is not None and attention_head_injection is not None:
+
+                if attention_head_drop.shape[1] == 1:
+                    import pdb; breakpoint()
+                    assert x[0].shape == attention_head_injection[:,attention_head_drop[:, 0],:].sum(1).shape, (x[0].shape, attention_head_injection[:,attention_head_drop[:, 0],:].sum(1).shape)
+                    x[0] = x[0] + attention_head_injection[:,attention_head_drop[:, 0],:].sum(1) - self.proj.bias*attention_head_drop[:, 0].shape[0]
+                else:
+                    if zero_shot:
+                        attention_head_drop[:, 1] = torch.where(attention_head_drop[:, 1] != 0, attention_head_drop[:, 1] + 98, attention_head_drop[:, 1])
+
+                    #or token in range(len(attention_head_drop[:, 1])):
+                    
+                    changes = attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:] 
+
+                    if zero_shot:
+                        attention_head_drop[:, 1] = torch.where(attention_head_drop[:, 1] != 0, attention_head_drop[:, 1] - 98, attention_head_drop[:, 1])
+
+                    index_tensor = attention_head_drop[:, 1].unsqueeze(1)
+                    accum_holder = torch.zeros_like(x)
+                    accum_holder[0].scatter_add_(0, index_tensor.expand(-1, x.shape[-1]), changes)
+
+                    norm_accum_holder = torch.norm(accum_holder, dim=-1).nonzero()
+                    x[0][norm_accum_holder[:,1]]= accum_holder[0][norm_accum_holder[:,1]]
+                    #assert x[0,attention_head_drop[:, 1]].shape == attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:].shape, (x[0,attention_head_drop[:, 1]].shape, attention_head_injection[:,attention_head_drop[:, 0],:].shape)
+                        
+                    #x[0,attention_head_drop[:, 1]] = x[0,attention_head_drop[:, 1]] + attention_head_injection[attention_head_drop[:, 1],attention_head_drop[:, 0],:] - self.proj.bias
+                     """
         return x, separated

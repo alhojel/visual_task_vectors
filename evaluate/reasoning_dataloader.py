@@ -53,10 +53,10 @@ def round_image(img, options=(WHITE, BLACK, RED, GREEN, BLUE), outputs=None, t=(
     options = torch.tensor(options)
     opts = options.view(len(options), 1, 1, 3).permute(1, 2, 3, 0).to(img)
     nn = (((img + t).unsqueeze(-1) - opts) ** 2).float().mean(dim=2)
-    nn_indices = torch.argmin(nn, dim=-1)
+    nn_indices = torch.argmin(nn, dim=-1).to(img)
     if outputs is None:
         outputs = options
-    res_img = torch.tensor(outputs)[nn_indices]
+    res_img = torch.tensor(outputs).to(img)[nn_indices]
     return res_img
 
 # fixed as circle

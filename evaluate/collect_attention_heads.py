@@ -1,26 +1,14 @@
-import os.path
 from tqdm import trange
 import multitask_dataloader
-from evaluate_detection.box_ops import to_rectangle
-from evaluate_detection.canvas_ds import CanvasDataset
 from reasoning_dataloader import *
 import torchvision
 from mae_utils import *
 import argparse
 from pathlib import Path
 from segmentation_utils import *
-import matplotlib.pyplot as plt
 import numpy as np
-import h5py
 import pickle
-
-
-import numpy as np
-import os
-from contextlib import ExitStack
 import torch
-import torchvision.transforms as T
-from PIL import Image
 
 
 def get_args():
@@ -30,64 +18,57 @@ def get_args():
     parser.add_argument('--output_dir', default='../output_dir/')
     parser.add_argument('--device', default='cuda',
                         help='device to use for training / testing')
-    parser.add_argument('--base_dir', default='/shared/yossi_gandelsman/code/occlusionwalk/pascal', help='pascal base dir')
+    parser.add_argument('--base_dir', default='/home/ahojel/datasets/', help='pascal base dir')
     parser.add_argument('--seed', default=15, type=int)
     parser.add_argument('--t', default=[0, 0, 0], type=float, nargs='+')
     parser.add_argument('--ckpt', help='model checkpoint')
     parser.add_argument('--split', default=0, type=int)
     parser.add_argument('--purple', default=0, type=int)
     parser.add_argument('--flip', default=0, type=int)
+    parser.add_argument('--num_collections', default=100, type=int)
     parser.add_argument('--save_images', default=None, type=int, help='Save images')
     parser.add_argument('--query_support_list_file', default=None, type=str, help='Directory of query support list file')
     parser.add_argument('--iters', default=1000, type=int)
-    parser.add_argument('--store_latents', default=None, type=str, help='Where to store latents')
-
 
     return parser
 
-def write_latent(file_path, pass_id, latent, label):
-    """
-    Writes latent data, a string label, and a metric to an HDF5 file for a specific pass.
-    Creates the file and/or groups if they don't exist.
+def write_latent(file_path, label, latent):
+    file_path = file_path + '/' + label + '_mean_activations.pkl'
 
-    :param file_path: Path to the HDF5 file
-    :param pass_id: Identifier for the forward pass
-    :param latent: Latent data as a PyTorch tensor
-    :param label: Label for the forward pass as a string
-    :param metric: Numerical metric associated with the pass
-    """
-    # Ensure the latent data is a NumPy array
-    if isinstance(latent, torch.Tensor):
-        latent = latent.cpu().numpy()
+    current_activations_encoder = torch.stack(latent[:24])
+    current_activations_decoder = torch.stack(latent[24:])
 
+    try:
+        with open(file_path, 'rb') as file:
+            content = pickle.load(file)
+            running_count = content[0]
+            running_mean_activations_encoder = content[1]
+            running_mean_activations_decoder = content[2]
 
-    file_path += '.hdf5'
+        running_mean_activations_encoder = (running_mean_activations_encoder * running_count + current_activations_encoder) / (running_count + 1)
+        running_mean_activations_decoder = (running_mean_activations_decoder * running_count + current_activations_decoder) / (running_count + 1)
 
-    # Open or create the HDF5 file
-    with h5py.File(file_path, 'a') as h5file:
-        # Create or get group for pass
-        pass_group = h5file.require_group(f'pass_{pass_id}')
+    except FileNotFoundError:
+        running_count = 0
+        running_mean_activations_encoder = current_activations_encoder
+        running_mean_activations_decoder = current_activations_decoder
+    
+    content = [running_count + 1, running_mean_activations_encoder, running_mean_activations_decoder]
 
-        # Create a subgroup for the label
-        label_group = pass_group.require_group(f'{label}')
+    with open(file_path, 'wb') as file:
+        pickle.dump(content, file)
 
-        # Create datasets for latent and metric within the label group
-        label_group.create_dataset('encoder_latent', data=np.array(latent[:24]), compression="gzip", compression_opts=2)
-        label_group.create_dataset('decoder_latent', data=np.array(latent[24:]), compression="gzip", compression_opts=2)
-
-
-
-def _generate_result_for_canvas(args, model, canvas, premask_pass_indices = None, postmask_pass_indices = None, attention_heads=False):
+def _generate_result_for_canvas(args, model, canvas, collect_activations=False):
     """canvas is already in the right range."""
 
     ids_shuffle, len_keep = generate_mask_for_evaluation()
-    _, im_paste, _, latents = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
-                                    len_keep, device=args.device)
+    _, im_paste, _, latents, _ = generate_image(canvas.unsqueeze(0).to(args.device), model, ids_shuffle.to(args.device),
+                                    len_keep, device=args.device, collect_activations = collect_activations)
 
     canvas = torch.einsum('chw->hwc', canvas)
-    canvas = torch.clip((canvas.cpu().detach() * imagenet_std + imagenet_mean) * 255, 0, 255).int().numpy()
+    canvas = torch.clip((canvas * imagenet_std + imagenet_mean) * 255, 0, 255).int()
     assert canvas.shape == im_paste.shape, (canvas.shape, im_paste.shape)
-    return np.uint8(canvas), np.uint8(im_paste), latents
+    return canvas, im_paste, latents
 
 def evaluate(args):
     padding = 1
@@ -100,61 +81,125 @@ def evaluate(args):
         [torchvision.transforms.Resize((224 // 2 - padding, 224 // 2 - padding), 3),
          torchvision.transforms.Grayscale(3),
          torchvision.transforms.ToTensor()])]
-
-    ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
-                         flipped_order=args.flip, purple=args.purple, query_support_list_file=args.query_support_list_file, iters=args.iters)
     
     model = prepare_model(args.ckpt, arch=args.model)
     _ = model.to(args.device)
+    tasks = ["segmentation", "lowlight_enhance", "identity", "inpaint", "colorization"]
 
-    captions_subset = ["segmentation"]
-    captions = ["segmentation", "colorization", "lowlight enhance", "inpaint single random", "reddify", "greenify", "blueify"]
+    if not os.path.exists(os.path.join(args.output_dir, 'filtered_pairs.pkl')):
 
-    for idx in trange(len(ds)):
-        canvas = ds[idx]['grid']
+        query_pair_list = {}
+        metric_list = {}
 
-        query_name = ds[idx]['query_name']
-        support_name = ds[idx]['support_name']
+        for task in tasks:
+            query_pair_list[task] = []
+            metric_list[task] = []
+
+        for split in [1,2,3]:
+            ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=split, image_transform=image_transform, mask_transform=mask_transform,
+                         flipped_order=args.flip, purple=args.purple, iters=1000, type="trn")
+            
+            for idx in trange(len(ds)):
+                canvas = ds[idx]['grid']
+                q_name = ds[idx]['query_name']
+                s_name = ds[idx]['support_name']
+
+                for i in range(len(canvas)):
+
+                    curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+                    original_image, generated_result, _ = _generate_result_for_canvas(args, model, curr_canvas, collect_activations=False)
+
+                    if i == 0:
+                        metric = iou(original_image, generated_result)
+                    else:
+                        metric = mse(original_image, generated_result)
+
+                    query_pair_list[tasks[i]].append({'query_name':q_name, 'support_name':s_name})
+                    metric_list[tasks[i]].append(metric)
         
-        for i in range(len(canvas)):
+        # Create a dictionary to store the task-specific data
+        task_specific_data = {}
+        for task_idx, task in enumerate(tasks):
+            curr_pair_list = query_pair_list[tasks[task_idx]]
+            curr_metric_list = metric_list[tasks[task_idx]]
 
-            if captions[i] not in captions_subset:
-                continue
+            # Pair each metric with its corresponding pair and sort by metric (smallest first)
+            paired_list = sorted(zip(curr_metric_list, curr_pair_list), key=lambda x: x[0])
 
-            gen_holder = []
+            # Remove duplicates based on 'support_name', keeping the one with the best metric
+            unique_support = {}
+            for metric, pair in paired_list:
+                support_name = pair['support_name']
+                if support_name not in unique_support or unique_support[support_name][0] > metric:
+                    unique_support[support_name] = (metric, pair)
 
-            curr_canvas = (canvas[i] - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
-            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, attention_heads=True)
-            gen_holder.append(original_image)
-            gen_holder.append(generated_result)
-            if args.store_latents:
-                try:
-                    write_latent(args.store_latents, f'{query_name}___{support_name}', latents, captions[i])
-                except Exception as e:
-                    print(f"Failed to write latent for {query_name}___{support_name}. Error: {e}")
-            
-            
-            if args.output_dir and args.save_images is not None and idx % args.save_images == 0:
-                   
-                gen_holder = [np.array(img) for img in gen_holder]
+            # Now remove duplicates based on 'query_name', again keeping the best metric
+            unique_query = {}
+            for metric, pair in unique_support.values():
+                query_name = pair['query_name']
+                if query_name not in unique_query or unique_query[query_name][0] > metric:
+                    unique_query[query_name] = (metric, pair)
 
-                # Determine the number of images
-                num_images = len(gen_holder)
-                num_rows = 2  # Images distributed over two rows
-                num_cols = 1
-                fig_size = (num_cols * 2.2, num_rows * 2.5)  # Adjusted for vertical labels and reduced vertical spacing
-                fig, axs = plt.subplots(num_rows, num_cols, figsize=fig_size, squeeze=False)
-                
-                # Displaying each image in its own cell, left to right, top to bottom
-                for img_index, img in enumerate(gen_holder):
-                    row = img_index // num_cols
-                    col = img_index % num_cols
-                    axs[row, col].imshow(img)
-                    axs[row, col].axis('off')
-                
-                plt.savefig(os.path.join(args.output_dir, f'combined_{idx}_{captions[i]}_1.png'))
-                plt.show() 
+            # Extract the final list of pairs after all filtering
+            final_pairs = [pair for _, pair in unique_query.values()]
 
+            # Store the task-specific data
+            task_specific_data[task] = {
+                'query_pair_list': final_pairs,
+                'metric_list': [pair[0] for pair in unique_query.values()]
+            }
+
+        # Save the task-specific data to a pickle file
+        with open(os.path.join(args.output_dir, 'filtered_pairs.pkl'), 'wb') as f:
+            pickle.dump(task_specific_data, f)
+
+    with open(os.path.join(args.output_dir, 'filtered_pairs.pkl'), 'rb') as f:
+        data = pickle.load(f)
+    
+    for task_idx, task in enumerate(tasks):
+
+        query_pairs = data[task]["query_pair_list"]
+        metrics = data[task]["metric_list"]
+        ranked_pairs = sorted(zip(query_pairs, metrics), key=lambda x: x[1], reverse=True if task_idx==0 else False)
+        top_query_pairs = [pair[0] for pair in ranked_pairs[:args.num_collections]]
+
+        ds = multitask_dataloader.DatasetPASCAL(args.base_dir, fold=args.split, image_transform=image_transform, mask_transform=mask_transform,
+                         flipped_order=args.flip, purple=args.purple, query_support_list=top_query_pairs, iters=args.iters, type="trn", task=task_idx)
+        
+        for idx in trange(len(ds)):
+            canvas = ds[idx]['grid']
+
+            curr_canvas = (canvas - imagenet_mean[:, None, None]) / imagenet_std[:, None, None]
+            original_image, generated_result, latents = _generate_result_for_canvas(args, model, curr_canvas, collect_activations=True)
+        
+            write_latent(args.output_dir, tasks[task_idx], latents)
+
+
+def mse(target, ours):
+    ours = (torch.permute(ours / 255., (2, 0, 1)) - torch.tensor(imagenet_mean, dtype=torch.float32).to(ours.device)[:, None, None]) / torch.tensor(imagenet_std, dtype=torch.float32).to(ours.device)[:, None, None]
+    target = (torch.permute(target.to(ours.device) / 255., (2, 0, 1)) - torch.tensor(imagenet_mean, dtype=torch.float32).to(ours.device)[:, None, None]) / torch.tensor(imagenet_std, dtype=torch.float32).to(ours.device)[:, None, None]
+
+    target = target[:, 113:, 113:]
+    ours = ours[:, 113:, 113:]
+    mse = torch.mean((target - ours) ** 2)
+    return mse.item()
+
+def iou(original_image, generated_result):
+    fg_color=WHITE
+    bg_color=BLACK
+
+    original_image = round_image(original_image, [WHITE, BLACK])
+    generated_result = round_image(generated_result, [WHITE, BLACK], t=args.t)
+
+    target = original_image[113:, 113:].to(original_image)
+    ours = generated_result[113:, 113:].to(original_image)
+
+    fg_color = torch.tensor(fg_color, dtype=torch.float32, device=target.device)
+    seg_orig = ((target - fg_color[None, None, :]) == 0).all(dim=2)
+    seg_our = ((ours - fg_color[None, None, :]) == 0).all(dim=2)
+    iou = torch.sum(seg_orig & seg_our).float() / torch.sum(seg_orig | seg_our).float()
+
+    return iou
 if __name__ == '__main__':
     args = get_args()
 

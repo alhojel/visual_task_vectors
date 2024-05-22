@@ -10,9 +10,11 @@ from mae_utils import PURPLE, YELLOW
 import json
 import random
 
+random.seed(10)
+
 class DatasetPASCAL(Dataset):
     def __init__(self, datapath, fold, image_transform, mask_transform, padding: bool = 1, use_original_imgsize: bool = False, flipped_order: bool = False,
-                 reverse_support_and_query: bool = False, random: bool = False, ensemble: bool = False, purple: bool = False, query_support_list_file=None, iters=1000, avoid_list=None):
+                 reverse_support_and_query: bool = False, random: bool = False, ensemble: bool = False, purple: bool = False, query_support_list=None, iters=1000, avoid_list=None, type="val", task = None):
         self.fold = fold
         self.nfolds = 4
         self.flipped_order = flipped_order
@@ -22,22 +24,19 @@ class DatasetPASCAL(Dataset):
         self.ensemble = ensemble
         self.purple = purple
         self.use_original_imgsize = use_original_imgsize
+        self.type = type
 
-        self.iters = iters
-
-        self.query_support_list_file = query_support_list_file
+        self.query_support_pairs = query_support_list
         self.avoid_list = avoid_list
-        if query_support_list_file is not None:
-            with open(query_support_list_file, 'r') as file:
-                self.query_support_pairs = json.load(file)
 
         if avoid_list is not None:
             with open(avoid_list, 'r') as file:
                 self.avoid_pairs = json.load(file)
 
+        self.task = task
+
         self.img_path = os.path.join(datapath, 'VOCdevkit/VOC2012/JPEGImages/')
         self.ann_path = os.path.join(datapath, 'VOCdevkit/VOC2012/SegmentationClassAug/')
-        self.ann_path2 = os.path.join(datapath, 'VOCdevkit/VOC2012/SegmentationClass/')
         self.image_transform = image_transform
         self.reverse_support_and_query = reverse_support_and_query
         self.mask_transform = mask_transform
@@ -46,12 +45,17 @@ class DatasetPASCAL(Dataset):
         self.img_metadata = self.build_img_metadata()
         self.img_metadata_classwise = self.build_img_metadata_classwise()
 
+        if iters is not None:
+            self.iters = iters
+        else:
+            self.iters = len(self.img_metadata)
+
     def __len__(self):
-        return self.iters if self.query_support_list_file is None else len(self.query_support_pairs)
+        return self.iters if self.query_support_pairs is None else len(self.query_support_pairs)
 
     def __getitem__(self, idx):
         
-        if self.query_support_list_file is not None:
+        if self.query_support_pairs is not None:
             # Use query and support names from the JSON file
             pair = self.query_support_pairs[idx % len(self.query_support_pairs)]
             query_name = pair['query_name']
@@ -69,15 +73,27 @@ class DatasetPASCAL(Dataset):
         query_img, query_cmask, support_img, support_cmask, org_qry_imsize = self.load_frame(query_name, support_name)
 
         #Here do the three tasks
-        grid=[]
-
-        grid.append(self.segmentation_grid(query_img, query_cmask, support_img, support_cmask, class_sample_query, class_sample_support))
-        grid.append(self.colorization_grid(query_img, support_img))
-        #grid.append(self.neutral_copy_grid(query_img, support_img))
-        grid.append(self.bw_grid(query_img, support_img))
-        grid.append(self.lowlight_grid(query_img, support_img))
-        grid.append(self.inpaint_black_grid(query_img, support_img, r=1))
-        grid.append(self.inpaint_black_grid(query_img, support_img, r=2))
+        if self.task is None:
+            grid = []
+            grid.append(self.segmentation_grid(query_img, query_cmask, support_img, support_cmask, class_sample_query, class_sample_support))
+            grid.append(self.lowlight_grid(query_img, support_img))
+            grid.append(self.neutral_copy_grid(query_img, support_img))
+            grid.append(self.inpaint_black_grid(query_img, support_img, r=1))
+            grid.append(self.colorization_grid(query_img, support_img))
+        if self.task==0:
+            grid=self.segmentation_grid(query_img, query_cmask, support_img, support_cmask, class_sample_query, class_sample_support)
+        if self.task==1:
+            grid=self.lowlight_grid(query_img, support_img)
+        if self.task==2:
+            grid=self.neutral_copy_grid(query_img, support_img)
+        if self.task==3:
+            grid=self.inpaint_black_grid(query_img, support_img, r=1)
+        if self.task==4:
+            grid=self.colorization_grid(query_img, support_img)
+        if self.task==5:
+            grid=self.inpaint_black_grid_and_lowlight(query_img, support_img, r=1)
+        if self.task==6:
+            grid=self.segmentation_and_inpaint_grid(query_img, query_cmask, support_img, support_cmask, class_sample_query, class_sample_support, r=1)
         
         batch = {'query_name': query_name,
                  'support_name': support_name,
@@ -113,10 +129,7 @@ class DatasetPASCAL(Dataset):
 
     def read_mask(self, img_name):
         r"""Return segmentation mask in PIL Image"""
-        try:
-            mask = Image.open(os.path.join(self.ann_path, img_name) + '.png')
-        except:
-            mask = Image.open(os.path.join(self.ann_path2, img_name) + '.png')
+        mask = Image.open(os.path.join(self.ann_path, img_name) + '.png')
         return mask
 
     def read_img(self, img_name):
@@ -154,10 +167,10 @@ class DatasetPASCAL(Dataset):
 
         img_metadata = []
 
-        if self.query_support_list_file is not None:
-            img_metadata = read_metadata('val', 0) + read_metadata('val',1) + read_metadata('val', 2) + read_metadata('val', 3)
+        if self.query_support_pairs is not None:
+            img_metadata = read_metadata(self.type, 0) + read_metadata(self.type,1) + read_metadata(self.type, 2) + read_metadata(self.type, 3)
         else:
-            img_metadata = read_metadata('val', self.fold)
+            img_metadata = read_metadata(self.type, self.fold)
 
             if self.avoid_list is not None:
                 print("Before Filter", len(img_metadata))
@@ -166,7 +179,7 @@ class DatasetPASCAL(Dataset):
                 print("After Filter", len(img_metadata))
                 
         
-        print('Total (val) images are : %d' % len(img_metadata))
+        print('Total images are : %d' % len(img_metadata))
 
         return img_metadata
 
@@ -301,5 +314,90 @@ class DatasetPASCAL(Dataset):
         query_img = self.image_transform(query_img)
         support_img = self.image_transform(support_img)
         grid = self.create_grid_from_images_colorization(0.5*support_img, support_img, 0.5*query_img, query_img)
+        
+        return grid
+
+    def inpaint_black_grid_and_lowlight(self, query_img, support_img, r=0):
+        
+        query_img = self.image_transform(query_img)
+        support_img = self.image_transform(support_img)
+
+        query_mask = query_img.clone()
+        support_mask = support_img.clone()
+
+        _, h, w = query_mask.shape
+        square_size = min(h, w) // 4
+        if r == 0:
+            h_start2 = h_start = (h - square_size) // 2
+            w_start2 = w_start = (w - square_size) // 2
+        if r == 1:
+            h_start2 = h_start = random.randint(0, h - square_size)
+            w_start2 = w_start = random.randint(0, w - square_size)
+        if r == 2:
+            h_start = random.randint(0, h - square_size)
+            w_start = random.randint(0, w - square_size)
+            h_start2 = random.randint(0, h - square_size)
+            w_start2 = random.randint(0, w - square_size)
+        # Set the square to black for all channels
+        query_mask[:, h_start:h_start+square_size, w_start:w_start+square_size] = 0
+        support_mask[:, h_start2:h_start2+square_size, w_start2:w_start2+square_size] = 0
+        
+        grid = self.create_grid_from_images_colorization(0.5*support_mask, support_img, 0.5*query_mask, query_img)
+        
+        return grid
+
+    def segmentation_and_inpaint_grid(self, query_img, query_cmask, support_img, support_cmask, class_sample_query, class_sample_support, r=1):
+        if self.image_transform:
+            query_img = self.image_transform(query_img)
+        query_mask, query_ignore_idx = self.extract_ignore_idx(query_cmask, class_sample_query, purple=self.purple)
+        if self.mask_transform:
+            query_mask = self.mask_transform[0](query_mask)
+                
+        if self.image_transform:
+            support_img = self.image_transform(support_img)
+        support_mask, support_ignore_idx = self.extract_ignore_idx(support_cmask, class_sample_support, purple=self.purple)
+        if self.mask_transform:
+            support_mask = self.mask_transform[0](support_mask)
+        
+        _, h, w = query_mask.shape
+        square_size = min(h, w) // 4
+        if r == 0:
+            h_start2 = h_start = (h - square_size) // 2
+            w_start2 = w_start = (w - square_size) // 2
+        if r == 1:
+            h_start2 = h_start = random.randint(0, h - square_size)
+            w_start2 = w_start = random.randint(0, w - square_size)
+        if r == 2:
+            h_start = random.randint(0, h - square_size)
+            w_start = random.randint(0, w - square_size)
+            h_start2 = random.randint(0, h - square_size)
+            w_start2 = random.randint(0, w - square_size)
+        # Set the square to black for all channels
+
+        support_img[:, h_start:h_start+square_size, w_start:w_start+square_size] = 0
+        query_img[:, h_start2:h_start2+square_size, w_start2:w_start2+square_size] = 0
+        
+        grid = self.create_grid_from_images_segmentation(support_img, support_mask, query_img, query_mask, flip=self.flipped_order)
+        
+        
+        
+        if self.ensemble:
+            grid2 = self.create_grid_from_images_segmentation(support_img, support_mask, query_img, query_mask, (not self.flipped_order))
+
+
+            support_purple_mask, _ = self.extract_ignore_idx(support_cmask, class_sample_support,
+                                                                    purple=True)
+            if self.mask_transform:
+                support_purple_mask = self.mask_transform[0](support_purple_mask)
+
+            grid3 = self.create_grid_from_images_segmentation(support_img, support_purple_mask, query_img, query_mask,
+                                                flip=self.flipped_order)
+
+            grid4 = self.create_grid_from_images_segmentation(support_img, support_purple_mask, query_img, query_mask,
+                                                flip=(not self.flipped_order))
+
+            grid = grid, grid2, grid3, grid4
+        
+        
         
         return grid

@@ -113,9 +113,9 @@ def prepare_model(chkpt_dir, arch='mae_vit_large_patch16', device='cpu'):
 
 
 @torch.no_grad()
-def generate_image(orig_image, model, ids_shuffle, len_keep: int, e_vec = None, d_vec = None, device: str = 'cpu', convex = "False", drop_indices=None, premask_pass_indices = None, postmask_pass_indices = None, bottleneck_injection = None, prompt_skip = None, position = None, attention_heads=None, attention_injection=None, replace=0, abalate=False, a_e_attention_injection=None, a_d_attention_injection=None, record=True, replace_tokens=False):
+def generate_image(orig_image, model, ids_shuffle, len_keep: int, device: str = 'cpu', drop_indices=None, premask_pass_indices = None, attention_heads=None, attention_injection=None, collect_activations=False):
     """ids_shuffle is [bs, 196]"""
-    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, a_e_attention_injection, a_d_attention_injection, record, replace_tokens)
+    mask, orig_image, x, latents = generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, drop_indices, premask_pass_indices, attention_heads, attention_injection, collect_activations)
     num_patches = 14
     y = x.argmax(dim=-1)
     
@@ -159,7 +159,7 @@ def decode_raw_predicion(mask, model, num_patches, orig_image, y, x):
 
 
 @torch.no_grad()
-def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_vec, d_vec, convex, drop_indices, premask_pass_indices, postmask_pass_indices, bottleneck_injection , prompt_skip, position, attention_heads, attention_injection, replace, a_e_attention_injection, a_d_attention_injection, record, replace_tokens):
+def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, drop_indices, premask_pass_indices, attention_heads, attention_injection, record):
     latents_holder = []
     ids_shuffle = ids_shuffle.to(device)
     # make it a batch-like
@@ -190,24 +190,22 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
 
     original_shape = latent.shape
 
-    #encoder_pass_indices
     if premask_pass_indices is not None:
         latent = torch.index_select(latent, dim=1, index=torch.tensor(premask_pass_indices, device=latent.device))
-        #import pdb; breakpoint()
     
     # apply Transformer blocks
     for block_num, blk in enumerate(model.blocks):
         
         if attention_heads is not None and attention_heads.shape[0]!=0 and block_num in attention_heads[:,0]:
             if attention_injection is not None:
-                latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], attention_injection[0][block_num], replace_tokens, record=record, zero_shot=premask_pass_indices is not None)
+                latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], attention_injection[0][block_num], record=record, zero_shot=premask_pass_indices is not None)
             else:
                 latent, separate = blk(latent, attention_heads[attention_heads[:,0]==block_num][:,1:], record=record, zero_shot=premask_pass_indices is not None)
         else:
             latent, separate = blk(latent, record=record)
         
         if record:
-            latents_holder.append(separate.detach().cpu().numpy())
+            latents_holder.append(separate.detach().cpu())
         
     latent = model.norm(latent)
     x = model.decoder_embed(latent)
@@ -242,52 +240,30 @@ def generate_raw_prediction(device, ids_shuffle, len_keep, model, orig_image, e_
     x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
     # add pos embed
 
-    #latents_holder.append(x.detach().cpu().numpy())
-
     x = x + model.decoder_pos_embed
 
     # apply Transformer blocks
 
-    # Drop the indices in drop_indices across dim=1 and store them in a new tensor
     
     if drop_indices is not None:
-        #  Temporary holder
-        #holder = torch.index_select(x, dim=1, index=torch.tensor(np.array(drop_indices)).to(x.device))
-        # Now also drop them from latent
         x = torch.index_select(x, dim=1, index=torch.tensor([i for i in range(x.size(1)) if i not in drop_indices], device=latent.device))
     
     for block_num, blk in enumerate(model.decoder_blocks):
         if attention_heads is not None and attention_heads.shape[0]!=0 and block_num+24 in attention_heads[:,0]:
             if attention_injection is not None:
-                x, separate = blk(x, attention_heads[attention_heads[:,0]==block_num+24][:,1:], attention_injection[1][block_num], replace_tokens, record=record, zero_shot=premask_pass_indices is not None)
+                x, separate = blk(x, attention_heads[attention_heads[:,0]==block_num+24][:,1:], attention_injection[1][block_num], record=record, zero_shot=premask_pass_indices is not None)
             else:
                 x, separate = blk(x, attention_heads[attention_heads[:,0]==block_num+24][:,1:], record=record, zero_shot=premask_pass_indices is not None)
         else:
             x, separate = blk(x, record=record)
         
         if record:
-            latents_holder.append(separate.detach().cpu().numpy())
+            latents_holder.append(separate.detach().cpu())
             
     x = model.decoder_norm(x)
     # predictor projection
     x = model.decoder_pred(x)
-
-    # if drop_indices is not None:
-    #     # Re-insert zeros at the positions indicated by drop_indices
-    #     N, L, D = x.shape
-    #     # Create a tensor of zeros to insert
-    #     zeros_to_insert = torch.zeros(N, len(drop_indices), D, device=x.device)
-    #     zeros_to_insert[:,:] = x[:,1,:]
-    #     # Calculate the indices for the non-dropped elements
-    #     non_dropped_indices = [i for i in range(L + len(drop_indices)) if i not in drop_indices]
-    #     # Create a new tensor that will hold the result with zeros inserted
-    #     x_reconstructed = torch.zeros(N, L + len(drop_indices), D, device=x.device)
-    #     # Insert the non-dropped elements into the reconstructed tensor
-    #     x_reconstructed[:, non_dropped_indices, :] = x
-    #     # Insert the zeros into the reconstructed tensor at the positions of drop_indices
-    #     x_reconstructed[:, drop_indices, :] = zeros_to_insert
-    #     x = x_reconstructed
-
+    
     # remove cls token
     x = x[:, 1:, :]
 

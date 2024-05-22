@@ -1,5 +1,5 @@
 # Finding Visual Task Vectors
-### [Alberto Hojel*](https://alhojel.github.io/), [Yutong Bai*](https://yutongbai.com/), [Trevor Darrell](https://people.eecs.berkeley.edu/~trevor/), [Amir Globerson](http://www.cs.tau.ac.il/~gamir/), [Amir Bar*](https://amirbar.net)
+### [Alberto Hojel](https://alhojel.github.io/), [Yutong Bai](https://yutongbai.com/), [Trevor Darrell](https://people.eecs.berkeley.edu/~trevor/), [Amir Globerson](http://www.cs.tau.ac.il/~gamir/), [Amir Bar](https://amirbar.net)
 
 Welcome to the official repository for our paper: "Finding Visual Task Vectors."
 

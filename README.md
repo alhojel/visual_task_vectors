@@ -28,9 +28,7 @@ cd evaluate && python collect_attention_heads.py \
     --base_dir <pascal_5i_basedir> \
     --output_dir <outputs_dir> \
     --ckpt <model_ckp_path> \
-    --split <split> \
     --device <device> \ 
-    --task [0,1,2,3,4, None] \
     --num_collections 100 \ 
 ```
 

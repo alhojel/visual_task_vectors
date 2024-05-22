@@ -52,7 +52,7 @@ The script will run the REINFORCE algorithm using the mean activations computed 
 
 ### Evaluate the patching positions:
 ```
-cd evaluate && python reinforce_train.py \
+cd evaluate && python reinforce_evaluate.py \
     --model mae_vit_large_patch16 \
     --base_dir <pascal_5i_basedir> \
     --output_dir <outputs_dir> \

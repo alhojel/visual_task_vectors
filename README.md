@@ -1,4 +1,4 @@
-# Finding Visual Task Vectors (ECCV 2022)
+# Finding Visual Task Vectors (ECCV 2024)
 ### [Alberto Hojel](https://alhojel.github.io/), [Yutong Bai](https://yutongbai.com/), [Trevor Darrell](https://people.eecs.berkeley.edu/~trevor/), [Amir Globerson](http://www.cs.tau.ac.il/~gamir/), [Amir Bar](https://amirbar.net)
 
 Welcome to the official repository for our paper: ["Finding Visual Task Vectors."](https://arxiv.org/abs/2404.05729)

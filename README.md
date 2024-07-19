@@ -17,6 +17,10 @@ activations per task and use the REINFORCE algorithm to search for the subset
 of task vectors. The resulting task vectors guide the model towards performing a
 task better than the original model without the need for input-output examples
 
+## Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=alhojel/visual_task_vectors&type=Date)](https://star-history.com/#alhojel/visual_task_vectors&Date)
+
 ### Dataset preparation:
 
 Our evaluation pipeline is based on [Volumetric Aggregation Transformer](https://github.com/Seokju-Cho/Volumetric-Aggregation-Transformer). Please follow the dataset preparation steps for PASCAL-5i dataset in this repository. 
